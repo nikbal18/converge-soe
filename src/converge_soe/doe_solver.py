@@ -39,14 +39,12 @@ class OutputLogger:
 #when you create an SoeSolver, it runs filtering of input data, converts the network into clean pandas df, and builds the optimisation using Pyomo.
 ## this is a python dictionary describing the physical network, buses, lines, transformers and loads. 
 class SoeSolver:
-    def __init__(self, netw_ejson: dict, df_forecasts: pd.DataFrame, df_offers: pd.DataFrame,
+    def __init__(self, netw_ejson: dict, df_forecasts: pd.DataFrame,
                  envelope_abs_max=50.0, solver_options: dict = {}):
         self.netw_ejson = netw_ejson
         self.netw_ejson["components"] = dict(sorted(self.netw_ejson["components"].items()))  # For reprod/testing
         # pandas df with forecast power consumption for each customer.
         self.df_forecasts = df_forecasts
-        # df with offers from customers who are willing to be dispatched for network support
-        self.df_offers = df_offers
         # maximum envelope width
         self.envelope_abs_max = envelope_abs_max
         # Solver options defaults
@@ -77,11 +75,10 @@ class SoeSolver:
         loads = _netw_components(self.netw_ejson, "Load")
         self.netw_load_ids_set = set(x[0] for x in loads)# setting the base values for all loads in the network
 
-        self.forecast_load_ids = sorted(set.intersection(self.netw_load_ids_set, set(self.df_forecasts.index)))#each load gets it's own ID
+        self.forecast_load_ids = sorted(set.intersection(
+            self.netw_load_ids_set, set(self.df_forecasts.index)
+        ))
         self.df_forecasts_filt = self.df_forecasts.reindex(self.forecast_load_ids)
-
-        self.offer_load_ids = sorted(set.intersection(self.netw_load_ids_set, set(self.df_offers.index)))
-        self.df_offers_filt = self.df_offers.reindex(self.offer_load_ids)
 
     def _build_network_data(self):
         #builds a dataframe for each bus, branch and loads. Converts everything to pu terms. 
@@ -250,7 +247,7 @@ class SoeSolver:
 
         bus_idxs = self.buses.index
         branch_idxs = self.branches.index
-        partic_idxs = self.offer_load_ids
+        partic_idxs = self.forecast_load_ids
         busld_idxs = self.load_buses
 
         bus_oe_idxs = [(bus_id, oe) for bus_id in bus_idxs for oe in _oe_idxs]
@@ -344,16 +341,9 @@ class SoeSolver:
                 for oe in _oe_idxs:
                     r_bus_pu[bus_id, oe].append(reactive_power)
 
-            #if the node is a participant, their active power is the power injection (always negative). 
-            if load_id in self.offer_load_ids:
+            if load_id in self.forecast_load_ids:
                 for oe in _oe_idxs:
                     a_bus_pu[(bus_id, oe)].append(-self.model.p_inj_oe_kw[load_id, oe] * _kw_to_pu)
-
-            #if they're not a participant, their active power is fixed as the forecast value. 
-            elif load_id in self.forecast_load_ids:
-                active_power = self.df_forecasts_filt.loc[load_id, "real_power_w"] * _w_to_pu
-                for oe in _oe_idxs:
-                    a_bus_pu[(bus_id, oe)].append(active_power)
 
         # Allocation of soft variables
         #for each bus that has loads, and for each min and max envelope limit, it adds the net slack power at that bus. 
@@ -373,38 +363,6 @@ class SoeSolver:
         self.model.c = ConstraintList()
 
         # SOE constraints
-
-        for load_id in self.offer_load_ids:
-
-            # Lower or consumption
-            # each consumption and injection column contains pairs of (quantity, price), so go through and take each pair. If the customer didn't offer anything, set to 0.
-            if len(self.df_offers_filt.loc[load_id, "consumption"]) > 0:
-                offer_con_kw = self.df_offers_filt.loc[load_id, "consumption"][0][0]
-            else:
-                offer_con_kw = 0.0
-
-            # Raise or injection
-            if len(self.df_offers_filt.loc[load_id, "injection"]) > 0:
-                offer_inj_kw = self.df_offers_filt.loc[load_id, "injection"][0][0]
-            else:
-                offer_inj_kw = 0.0
-            #constraint that you can't dispatch a customer more than they offered. 
-            self.model.c.add(self.model.network_support_kw[load_id, 'con'] <= offer_con_kw)
-            self.model.c.add(self.model.network_support_kw[load_id, 'inj'] <= offer_inj_kw)
-            #customers pre-agreed envelope reservation, or what they are entitled to before any additional dispatch
-            res_min_inj_kw = self.df_offers_filt.loc[load_id, "reservation_l"]
-            res_max_inj_kw = self.df_offers_filt.loc[load_id, "reservation_u"]
-
-            # Envelope min inj <= reserve_min_injection + injection_ns - consumption_ns
-            self.model.c.add(
-                self.model.p_inj_oe_kw[load_id, 'oel'] <= res_min_inj_kw
-                + self.model.network_support_kw[load_id, 'inj'] - self.model.network_support_kw[load_id, 'con']
-            )
-
-            # Envelope max inj >= reserve_max_injection + injection_ns - consumption_ns
-            self.model.c.add(
-                self.model.p_inj_oe_kw[load_id, 'oer'] >= res_max_inj_kw
-                + self.model.network_support_kw[load_id, 'inj'] - self.model.network_support_kw[load_id, 'con'])
 
         # Power flow constraints
 
@@ -485,22 +443,14 @@ class SoeSolver:
         # Objective function -----------------------------------------------------------------------------------------
         #minimises the sum of three terms, with each representing a different priority. 
         #firstly, for every participant being dispatched, calculate the cost for the dispatch quantity. Summed separately for consumption and injection dispatches, then added together. 
-        first_term = sum(
-            self.model.network_support_kw[load_id, 'con'] *
-            self.df_offers_filt.loc[load_id, "consumption"][0][1] * (5/60.0) for load_id in self.offer_load_ids if
-            len(self.df_offers_filt.loc[load_id, "consumption"]) > 0
-        ) + sum(
-            self.model.network_support_kw[load_id, 'inj']
-            * self.df_offers_filt.loc[load_id, "injection"][0][1] * (5/60.0)
-            for load_id in self.offer_load_ids if len(self.df_offers_filt.loc[load_id, "injection"]) > 0
-        )
+        first_term = 0
 
         big_weight = 1000.0  # Dollars per kWh
         small_weight = 0.001  # Dollars per kWh
         #second term is the envelope width penalty, a small cost for smaller envelopes so tend towards wider envelopes. 
         second_term = small_weight * sum(
             self.model.p_inj_oe_kw[load_id, 'oel'] - self.model.p_inj_oe_kw[load_id, 'oer']
-            for load_id in self.offer_load_ids
+            for load_id in self.forecast_load_ids
         )
 
         #Third term is penalty for violation, $1000/kWh, only a last resort option. 
@@ -583,41 +533,15 @@ class SoeSolver:
         else:
             results_viol = pd.DataFrame()
 
-        # Operating envelopes and network support
+        # Operating envelopes
 
         recs = []
-        for load_id in self.offer_load_ids:
-            if len(self.df_offers_filt.loc[load_id, "consumption"]) > 0:
-                ns_con_kw = -self.model.network_support_kw[load_id, 'con'].value
-                ns_con_dol = abs(ns_con_kw) * self.df_offers_filt.loc[load_id, "consumption"][0][1] * (5/60.0)
-            else:
-                ns_con_kw = 0.0
-                ns_con_dol = 0.0
-
-            if len(self.df_offers_filt.loc[load_id, "injection"]) > 0:
-                ns_inj_kw = self.model.network_support_kw[load_id, 'inj'].value
-                ns_inj_dol = abs(ns_inj_kw) * self.df_offers_filt.loc[load_id, "injection"][0][1] * (5/60.0)
-            else:
-                ns_inj_kw = 0.0
-                ns_inj_dol = 0.0
-
-            # Note - only one of these should be nonzero.
-            ns_net_inj_kw = ns_inj_kw - ns_con_kw
-            ns_net_dol = ns_con_dol + ns_inj_dol
-
-            # For output, to be consistent with what is in dagster, we need to use the generation convention for
-            # operating envelope and dispatch.
-            # TODO: Consider converting all the code relating to these to generation convention, to
-            # avoid confusion.
-            recs.append(
-                {
-                    "load_id": load_id,
-                    "soe_lb_kw": self.model.p_inj_oe_kw[load_id, 'oel'].value,  # Min injection
-                    "soe_ub_kw": self.model.p_inj_oe_kw[load_id, 'oer'].value,  # Min injection
-                    "dispatch_kw": ns_net_inj_kw,  # +ve = injection dispatch; -ve = consumption dispatch
-                    "payment_dlr": ns_net_dol
-                }
-            )
+        for load_id in self.forecast_load_ids:
+            recs.append({
+                "load_id": load_id,
+                "doe_lb_kw": self.model.p_inj_oe_kw[load_id, 'oel'].value,
+                "doe_ub_kw": self.model.p_inj_oe_kw[load_id, 'oer'].value,
+            })
 
         results_soe = pd.DataFrame.from_records(recs).set_index("load_id").round(6) if len(recs) > 0 else pd.DataFrame()
 
@@ -638,9 +562,6 @@ class SoeSolver:
 
             if load_id in self.forecast_load_ids:
                 bus_ld_r_kw[bus_id] += self.df_forecasts_filt.loc[load_id, "reactive_power_var"] * 1e-3
-
-                if load_id not in self.offer_load_ids:
-                    bus_ld_a_kw[bus_id] += self.df_forecasts_filt.loc[load_id, "real_power_w"] * 1e-3
 
         return (bus_ld_a_kw, bus_ld_r_kw)
 

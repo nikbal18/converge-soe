@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: converge_soe
+Version: 0.0.1
+License-File: LICENSE
+License-File: NOTICE
+Requires-Dist: numpy>=1.26.4
+Requires-Dist: pandas>=2.2.1
+Requires-Dist: pyomo>=6.7.1
+Dynamic: license-file

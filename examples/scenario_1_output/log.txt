@@ -1,0 +1,55 @@
+Ipopt 3.14.19: print_level=3
+linear_solver=ma27
+
+Exception of type: DYNAMIC_LIBRARY_FAILURE in file "../../src/Common/IpLibraryLoader.cpp" at line 83:
+ Exception message: Error 126 while loading DLL libhsl.dll via LoadLibraryA: The specified module could not be found.
+
+
+
+EXIT: Library loading failure.
+
+Ipopt 3.14.19: print_level=3
+linear_solver=mumps
+
+
+
+******************************************************************************
+This program contains Ipopt, a library for large-scale nonlinear optimization.
+ Ipopt is released as open source code under the Eclipse Public License (EPL).
+         For more information visit https://github.com/coin-or/Ipopt
+******************************************************************************
+
+Total number of variables............................:       50
+                     variables with only lower bounds:       34
+                variables with lower and upper bounds:        4
+                     variables with only upper bounds:        0
+Total number of equality constraints.................:       26
+Total number of inequality constraints...............:       26
+        inequality constraints with only lower bounds:        6
+   inequality constraints with lower and upper bounds:        0
+        inequality constraints with only upper bounds:       20
+
+
+
+Number of Iterations....: 33
+
+                                   (scaled)                 (unscaled)
+Objective...............:  -2.0447113891726770e-03   -2.0447113891726768e-02
+Dual infeasibility......:   3.8800742776612211e-09    3.8800742776612211e-08
+Constraint violation....:   2.6458012619993629e-14    2.6458012619993629e-14
+Variable bound violation:   9.9749412245938707e-09    9.9749412245938707e-09
+Complementarity.........:   2.5135471851798820e-09    2.5135471851798819e-08
+Overall NLP error.......:   3.8800742776612211e-09    3.8800742776612211e-08
+
+
+Number of objective function evaluations             = 37
+Number of objective gradient evaluations             = 34
+Number of equality constraint evaluations            = 37
+Number of inequality constraint evaluations          = 37
+Number of equality constraint Jacobian evaluations   = 34
+Number of inequality constraint Jacobian evaluations = 34
+Number of Lagrangian Hessian evaluations             = 33
+Total seconds in IPOPT                               = 0.042
+
+EXIT: Optimal Solution Found.
+

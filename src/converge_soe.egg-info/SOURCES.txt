@@ -1,0 +1,11 @@
+LICENSE
+NOTICE
+README.md
+pyproject.toml
+src/converge_soe/__init__.py
+src/converge_soe/soe_solver.py
+src/converge_soe.egg-info/PKG-INFO
+src/converge_soe.egg-info/SOURCES.txt
+src/converge_soe.egg-info/dependency_links.txt
+src/converge_soe.egg-info/requires.txt
+src/converge_soe.egg-info/top_level.txt

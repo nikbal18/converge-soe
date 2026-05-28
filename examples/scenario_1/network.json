@@ -1,0 +1,82 @@
+{
+  "units": {
+    "voltage": 1000,
+    "current": 1,
+    "power": 1000,
+    "impedance": 1
+  },
+  "components": {
+    "inf1": {
+      "Infeeder": {
+        "v_setpoint": 11.0,
+        "cons": [{"node": "bus_hv"}]
+      }
+    },
+    "bus_hv": {
+      "Node": {
+        "v_base": 11.0
+      }
+    },
+    "bus_lv": {
+      "Node": {
+        "v_base": 0.415,
+        "user_data": {"v_min": 0.390, "v_max": 0.440}
+      }
+    },
+    "bus_a": {
+      "Node": {
+        "v_base": 0.415,
+        "user_data": {"v_min": 0.390, "v_max": 0.440}
+      }
+    },
+    "bus_b": {
+      "Node": {
+        "v_base": 0.415,
+        "user_data": {"v_min": 0.390, "v_max": 0.440}
+      }
+    },
+    "tx1": {
+      "Transformer": {
+        "cons": [{"node": "bus_hv"}, {"node": "bus_lv"}],
+        "z": [[0.0, 0.0], [0.0067, 0.034]],
+        "nom_turns_ratio": [26.506],
+        "taps": [0],
+        "tap_factor": 0.025,
+        "tap_side": "primary",
+        "vector_group": ["YNyn0", "YNyn0"],
+        "s_max": 200,
+        "v_winding_base": [11.0, 0.415]
+      }
+    },
+    "line_1": {
+      "Line": {
+        "cons": [{"node": "bus_lv"}, {"node": "bus_a"}],
+        "length": 0.3,
+        "z": [1.0, 0.4],
+        "z0": [2.0, 0.8],
+        "i_max": 200
+      }
+    },
+    "line_2": {
+      "Line": {
+        "cons": [{"node": "bus_a"}, {"node": "bus_b"}],
+        "length": 0.3,
+        "z": [1.0, 0.4],
+        "z0": [2.0, 0.8],
+        "i_max": 200
+      }
+    },
+    "1001": {
+      "Load": {"cons": [{"node": "bus_a"}]}
+    },
+    "1002": {
+      "Load": {"cons": [{"node": "bus_a"}]}
+    },
+    "1003": {
+      "Load": {"cons": [{"node": "bus_b"}]}
+    },
+    "1004": {
+      "Load": {"cons": [{"node": "bus_b"}]}
+    }
+  }
+}

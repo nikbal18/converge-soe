@@ -45,7 +45,7 @@ offers = convert(pd.read_csv(
 csoe.logger.addHandler(logging.FileHandler(outdir / 'log.txt'))
 
 solver = csoe.SoeSolver(
-    netw, forecast, offers, envelope_abs_max=50.0, solver_options={'linear_solver': 'ma27'}
+    netw, forecast, offers, envelope_abs_max=50.0, solver_options={}
 )
 status, results = solver.solve()
 
