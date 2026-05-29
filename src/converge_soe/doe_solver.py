@@ -40,13 +40,24 @@ class OutputLogger:
 ## this is a python dictionary describing the physical network, buses, lines, transformers and loads. 
 class SoeSolver:
     def __init__(self, netw_ejson: dict, df_forecasts: pd.DataFrame,
-                 envelope_abs_max=50.0, solver_options: dict = {}):
+                 envelope_abs_max=50.0, transformer_params: dict = None,
+                 theta_A: float = 20.0, thermal_state_in: dict = None,
+                 solver_options: dict = {}):
         self.netw_ejson = netw_ejson
         self.netw_ejson["components"] = dict(sorted(self.netw_ejson["components"].items()))  # For reprod/testing
         # pandas df with forecast power consumption for each customer.
         self.df_forecasts = df_forecasts
         # maximum envelope width
         self.envelope_abs_max = envelope_abs_max
+        # IEEE C57.91 transformer thermal model parameters (optional).
+        # Keys: tau_TO, tau_W, delta_theta_TO_R, delta_theta_HS_R, R, n, m, I_rated, theta_HS_max, dt
+        self.transformer_params = transformer_params
+        # Ambient temperature (°C) for the current time step.
+        self.theta_A = theta_A
+        # Thermal state from the previous period, keyed by transformer branch ID.
+        # Each value is a dict with 'delta_theta_TO' and 'delta_theta_HS' (°C).
+        # Defaults to cold start (0 °C rises) for any transformer not present.
+        self.thermal_state_in = thermal_state_in if thermal_state_in is not None else {}
         # Solver options defaults
         self.solver_options = {'print_level': 3, 'linear_solver': 'mumps'}
 
@@ -334,16 +345,12 @@ class SoeSolver:
             load_id = load_row.Index
             bus_id = load_row.bus_id
 
-            #reactive power: any load that has a forecast contributes it's reactive power forecast to the total (which is summed up later). 
-            #reactive power always treated as a fixed known quantity, no envelopes used. 
             if load_id in self.forecast_load_ids:
                 reactive_power = self.df_forecasts_filt.loc[load_id, "reactive_power_var"] * _w_to_pu
+                active_power = self.df_forecasts_filt.loc[load_id, "real_power_w"] * _w_to_pu
                 for oe in _oe_idxs:
                     r_bus_pu[bus_id, oe].append(reactive_power)
-
-            if load_id in self.forecast_load_ids:
-                for oe in _oe_idxs:
-                    a_bus_pu[(bus_id, oe)].append(-self.model.p_inj_oe_kw[load_id, oe] * _kw_to_pu)
+                    a_bus_pu[bus_id, oe].append(active_power)
 
         # Allocation of soft variables
         #for each bus that has loads, and for each min and max envelope limit, it adds the net slack power at that bus. 
@@ -361,8 +368,6 @@ class SoeSolver:
         # Constraints ------------------------------------------------------------------------------------------------
 
         self.model.c = ConstraintList()
-
-        # SOE constraints
 
         # Power flow constraints
 
@@ -436,32 +441,69 @@ class SoeSolver:
                     self.model.branch_reactive_pu[branch_id, oe] * self.model.branch_reactive_pu[branch_id, oe]
                 )
 
-                #current in a cable can't exceed rated maximum. 
+                #current in a cable can't exceed rated maximum.
                 if pd.notna(branch_row.i_max_pu):
                     self.model.c.add(self.model.square_current_pu[branch_id, oe] <= branch_row.i_max_pu**2)
-        # everything is squared here, because working with V^2 and I^2 keeps the constraints in a form that avoids square roots. 
-        # Objective function -----------------------------------------------------------------------------------------
-        #minimises the sum of three terms, with each representing a different priority. 
-        #firstly, for every participant being dispatched, calculate the cost for the dispatch quantity. Summed separately for consumption and injection dispatches, then added together. 
-        first_term = 0
+        # everything is squared here, because working with V^2 and I^2 keeps the constraints in a form that avoids square roots.
 
-        big_weight = 1000.0  # Dollars per kWh
-        small_weight = 0.001  # Dollars per kWh
-        #second term is the envelope width penalty, a small cost for smaller envelopes so tend towards wider envelopes. 
-        second_term = small_weight * sum(
+        # Transformer thermal constraints (IEEE C57.91) --------------------------------------------------------------
+        # Exact exponential step-response discretisation of the two-layer ODE.
+        # With n=m=1 (linearised) the constraint is linear in square_current_pu.
+        if self.transformer_params is not None:
+            tp = self.transformer_params
+            R            = tp['R']
+            n            = tp['n']
+            m            = tp['m']
+            dTO_R        = tp['delta_theta_TO_R']
+            dHS_R        = tp['delta_theta_HS_R']
+            I_rated      = tp['I_rated']
+            theta_HS_max = tp['theta_HS_max']
+            dt           = tp['dt']  # time-step length in minutes
+
+            # Precompute scalar step-response coefficients
+            alpha_TO = 1.0 - np.exp(-dt / tp['tau_TO'])
+            alpha_W  = 1.0 - np.exp(-dt / tp['tau_W'])
+
+            for tx_row in self.transformers.itertuples():
+                tx_id    = tx_row.Index
+                i_base_a = tx_row.i_base_a
+                # K² = I²/I_rated² = square_current_pu * (i_base_a/I_rated)²
+                c2 = (i_base_a / I_rated) ** 2
+
+                prev   = self.thermal_state_in.get(tx_id, {})
+                dTO_0  = prev.get('delta_theta_TO', 0.0)
+                dHS_0  = prev.get('delta_theta_HS', 0.0)
+
+                for oe in _oe_idxs:
+                    K2 = self.model.square_current_pu[tx_id, oe] * c2
+
+                    # Ultimate temperature rises — IEEE C57.91 exact form
+                    delta_TO_U = dTO_R * ((K2 * R + 1) / (R + 1)) ** n
+                    delta_HS_U = dHS_R * K2 ** m
+
+                    # Step-response (exact discretisation of the first-order ODEs)
+                    delta_TO = (delta_TO_U - dTO_0) * alpha_TO + dTO_0
+                    delta_HS = (delta_HS_U - dHS_0) * alpha_W  + dHS_0
+
+                    self.model.c.add(
+                        self.theta_A + delta_TO + delta_HS <= theta_HS_max
+                    )
+
+        # Objective function -----------------------------------------------------------------------------------------
+
+        small_weight = 0.001  # Nudge towards wider envelopes to break degeneracy
+        width_term = small_weight * sum(
             self.model.p_inj_oe_kw[load_id, 'oel'] - self.model.p_inj_oe_kw[load_id, 'oer']
             for load_id in self.forecast_load_ids
         )
 
-        #Third term is penalty for violation, $1000/kWh, only a last resort option. 
-        third_term = big_weight * (
-            sum(
-                self.model.sof_bus_a_kw[bus_id, oe, ci] + self.model.sof_bus_r_kw[bus_id, oe, ci]
-                for bus_id in self.load_buses for oe in _oe_idxs for ci in _ci_idxs
-            )
+        big_weight = 1000.0  # Violation penalty — last resort
+        viol_term = big_weight * sum(
+            self.model.sof_bus_a_kw[bus_id, oe, ci] + self.model.sof_bus_r_kw[bus_id, oe, ci]
+            for bus_id in self.load_buses for oe in _oe_idxs for ci in _ci_idxs
         )
 
-        self.model.value = Objective(expr=first_term + second_term + third_term, sense=minimize)
+        self.model.value = Objective(expr=width_term + viol_term, sense=minimize)
     #this is the IPOPT solver instance, calling the solver. 
     def _solve_opt_model(self):
         solver = SolverFactory("ipopt")
@@ -545,7 +587,44 @@ class SoeSolver:
 
         results_soe = pd.DataFrame.from_records(recs).set_index("load_id").round(6) if len(recs) > 0 else pd.DataFrame()
 
-        return namedtuple("Results", "bus branch viol soe")(results_bus, results_branch, results_viol, results_soe)
+        # Transformer thermal state output — pass as thermal_state_in to the next period
+        thermal_state_out = {}
+        if self.transformer_params is not None:
+            tp       = self.transformer_params
+            R        = tp['R'];  n = tp['n'];  m = tp['m']
+            dTO_R    = tp['delta_theta_TO_R']
+            dHS_R    = tp['delta_theta_HS_R']
+            I_rated  = tp['I_rated']
+            dt       = tp['dt']
+            alpha_TO = 1.0 - np.exp(-dt / tp['tau_TO'])
+            alpha_W  = 1.0 - np.exp(-dt / tp['tau_W'])
+
+            for tx_row in self.transformers.itertuples():
+                tx_id    = tx_row.Index
+                i_base_a = tx_row.i_base_a
+                c2       = (i_base_a / I_rated) ** 2
+
+                prev   = self.thermal_state_in.get(tx_id, {})
+                dTO_0  = prev.get('delta_theta_TO', 0.0)
+                dHS_0  = prev.get('delta_theta_HS', 0.0)
+
+                # Both oe scenarios have equal current with fixed loads; use 'oel' arbitrarily
+                K2_val     = self.model.square_current_pu[tx_id, 'oel'].value * c2
+                delta_TO_U = dTO_R * ((K2_val * R + 1) / (R + 1)) ** n
+                delta_HS_U = dHS_R * K2_val ** m
+
+                delta_TO_new = (delta_TO_U - dTO_0) * alpha_TO + dTO_0
+                delta_HS_new = (delta_HS_U - dHS_0) * alpha_W  + dHS_0
+
+                thermal_state_out[tx_id] = {
+                    'delta_theta_TO': delta_TO_new,
+                    'delta_theta_HS': delta_HS_new,
+                    'theta_HS':       self.theta_A + delta_TO_new + delta_HS_new,
+                }
+
+        return namedtuple("Results", "bus branch viol soe thermal_state")(
+            results_bus, results_branch, results_viol, results_soe, thermal_state_out
+        )
     # this is called at the start of the model, which pre-computes background load at each bus before the optimization model is built. 
     def _calculate_bus_loads_kw(self, bus_idxs):
         '''
