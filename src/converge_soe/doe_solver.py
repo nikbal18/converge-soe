@@ -40,7 +40,9 @@ class OutputLogger:
 ## this is a python dictionary describing the physical network, buses, lines, transformers and loads. 
 class SoeSolver:
     def __init__(self, netw_ejson: dict, df_forecasts: pd.DataFrame,
-                 envelope_abs_max=50.0, transformer_params: dict = None,
+                 envelope_abs_max=50.0, participant_load_ids=None,
+                 df_prices: pd.DataFrame = None,
+                 transformer_params: dict = None,
                  theta_A: float = 20.0, thermal_state_in: dict = None,
                  solver_options: dict = {}):
         self.netw_ejson = netw_ejson
@@ -49,6 +51,11 @@ class SoeSolver:
         self.df_forecasts = df_forecasts
         # maximum envelope width
         self.envelope_abs_max = envelope_abs_max
+        # None = every forecast load gets an envelope; otherwise only the supplied IDs do.
+        self.participant_load_ids_input = participant_load_ids
+        # Optional price table for participants: index=load_id, column 'export_price_kwh'.
+        # Missing participants default to price 0 (no economic signal for that load).
+        self.df_prices = df_prices
         # IEEE C57.91 transformer thermal model parameters (optional).
         # Keys: tau_TO, tau_W, delta_theta_TO_R, delta_theta_HS_R, R, n, m, I_rated, theta_HS_max, dt
         self.transformer_params = transformer_params
@@ -90,6 +97,22 @@ class SoeSolver:
             self.netw_load_ids_set, set(self.df_forecasts.index)
         ))
         self.df_forecasts_filt = self.df_forecasts.reindex(self.forecast_load_ids)
+
+        if self.participant_load_ids_input is None:
+            self.partic_load_ids = self.forecast_load_ids
+        else:
+            self.partic_load_ids = sorted(
+                set(self.participant_load_ids_input) & self.netw_load_ids_set
+            )
+
+        # Build a price Series indexed by partic_load_ids; missing entries default to 0.
+        if self.df_prices is not None:
+            self.partic_prices = (
+                self.df_prices['export_price_kwh']
+                .reindex(self.partic_load_ids, fill_value=0.0)
+            )
+        else:
+            self.partic_prices = pd.Series(0.0, index=self.partic_load_ids)
 
     def _build_network_data(self):
         #builds a dataframe for each bus, branch and loads. Converts everything to pu terms. 
@@ -258,7 +281,7 @@ class SoeSolver:
 
         bus_idxs = self.buses.index
         branch_idxs = self.branches.index
-        partic_idxs = self.forecast_load_ids
+        partic_idxs = self.partic_load_ids
         busld_idxs = self.load_buses
 
         bus_oe_idxs = [(bus_id, oe) for bus_id in bus_idxs for oe in _oe_idxs]
@@ -345,12 +368,17 @@ class SoeSolver:
             load_id = load_row.Index
             bus_id = load_row.bus_id
 
-            if load_id in self.forecast_load_ids:
+            if load_id in self.partic_load_ids:
+                reactive_power = self.df_forecasts_filt.loc[load_id, "reactive_power_var"] * _w_to_pu
+                for oe in _oe_idxs:
+                    r_bus_pu[bus_id, oe].append(reactive_power)
+                    a_bus_pu[(bus_id, oe)].append(-self.model.p_inj_oe_kw[load_id, oe] * _kw_to_pu)
+            elif load_id in self.forecast_load_ids:
                 reactive_power = self.df_forecasts_filt.loc[load_id, "reactive_power_var"] * _w_to_pu
                 active_power = self.df_forecasts_filt.loc[load_id, "real_power_w"] * _w_to_pu
                 for oe in _oe_idxs:
                     r_bus_pu[bus_id, oe].append(reactive_power)
-                    a_bus_pu[bus_id, oe].append(active_power)
+                    a_bus_pu[(bus_id, oe)].append(active_power)
 
         # Allocation of soft variables
         #for each bus that has loads, and for each min and max envelope limit, it adds the net slack power at that bus. 
@@ -491,10 +519,16 @@ class SoeSolver:
 
         # Objective function -----------------------------------------------------------------------------------------
 
+        # Economic surplus: maximise price × export envelope width (5-min interval = 5/60 h)
+        benefit_term = -(5.0 / 60.0) * sum(
+            self.partic_prices[load_id] * self.model.p_inj_oe_kw[load_id, 'oer']
+            for load_id in self.partic_load_ids
+        )
+
         small_weight = 0.001  # Nudge towards wider envelopes to break degeneracy
         width_term = small_weight * sum(
             self.model.p_inj_oe_kw[load_id, 'oel'] - self.model.p_inj_oe_kw[load_id, 'oer']
-            for load_id in self.forecast_load_ids
+            for load_id in self.partic_load_ids
         )
 
         big_weight = 1000.0  # Violation penalty — last resort
@@ -503,7 +537,7 @@ class SoeSolver:
             for bus_id in self.load_buses for oe in _oe_idxs for ci in _ci_idxs
         )
 
-        self.model.value = Objective(expr=width_term + viol_term, sense=minimize)
+        self.model.value = Objective(expr=benefit_term + width_term + viol_term, sense=minimize)
     #this is the IPOPT solver instance, calling the solver. 
     def _solve_opt_model(self):
         solver = SolverFactory("ipopt")
@@ -578,7 +612,7 @@ class SoeSolver:
         # Operating envelopes
 
         recs = []
-        for load_id in self.forecast_load_ids:
+        for load_id in self.partic_load_ids:
             recs.append({
                 "load_id": load_id,
                 "doe_lb_kw": self.model.p_inj_oe_kw[load_id, 'oel'].value,

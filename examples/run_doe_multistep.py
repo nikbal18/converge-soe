@@ -76,7 +76,7 @@ _resp = requests.get(
         'hourly':     'temperature_2m',
         'start_date': str(_start_date),
         'end_date':   str(_end_date),
-        'timezone':   'UTC',
+        'timezone':   'UTC+11',
     },
     timeout=30,
 )
