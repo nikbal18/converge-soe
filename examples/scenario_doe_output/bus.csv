@@ -1,0 +1,5 @@
+id,voltage_pu_oel,voltage_pu_oer
+bus_a,0.948033,0.948033
+bus_b,0.939759,0.939759
+bus_hv,1.0,1.0
+bus_lv,0.998223,0.998223

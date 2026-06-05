@@ -1,0 +1,12 @@
+{
+  "tau_TO":           60.0,
+  "tau_W":             7.0,
+  "delta_theta_TO_R": 55.0,
+  "delta_theta_HS_R": 23.0,
+  "R":                 6.0,
+  "n":                 0.8,
+  "m":                 0.8,
+  "I_rated":          50.0,
+  "theta_HS_max":    120.0,
+  "dt":               30.0
+}
