@@ -27,6 +27,7 @@ from pathlib import Path
 import logging
 
 import pandas as pd
+import requests
 
 import converge_soe as csoe
 
@@ -36,6 +37,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument('indir',  type=str, help='Input folder (network.json, forecast_timeseries.csv, transformer_params.json)')
 parser.add_argument('outdir', type=str, help='Output folder')
 args = parser.parse_args()
+
+SITE_LAT =  -35.2035  # central Canberra
+SITE_LON =  149.1548
 
 indir  = Path(args.indir)
 outdir = Path(args.outdir)
@@ -51,11 +55,41 @@ with (indir / 'transformer_params.json').open() as f:
 
 forecast_ts = pd.read_csv(
     indir / 'forecast_timeseries.csv',
-    dtype={'load_id': str, 'timestamp': str}
+    dtype={'load_id': str}
 )
+forecast_ts['timestamp'] = pd.to_datetime(forecast_ts['timestamp'])
 
-# Ambient temperature — fixed here, but could be read from a CSV per timestep.
-theta_A = 30.0  # °C
+# --- Ambient temperature from Open-Meteo (archive API, ERA5) ---------------------
+
+_ts_sorted  = sorted(forecast_ts['timestamp'].unique())
+_start_date = _ts_sorted[0].date()
+_end_date   = _ts_sorted[-1].date()
+
+logging.info(f"Fetching Open-Meteo temperature for ({SITE_LAT}, {SITE_LON}) "
+             f"{_start_date} → {_end_date}")
+
+_resp = requests.get(
+    'https://archive-api.open-meteo.com/v1/archive',
+    params={
+        'latitude':   SITE_LAT,
+        'longitude':  SITE_LON,
+        'hourly':     'temperature_2m',
+        'start_date': str(_start_date),
+        'end_date':   str(_end_date),
+        'timezone':   'UTC',
+    },
+    timeout=30,
+)
+_resp.raise_for_status()
+_om = _resp.json()
+
+# Build hourly Series (timezone-naive to match forecast timestamps)
+_hourly_idx   = pd.to_datetime(_om['hourly']['time']).tz_localize(None)
+_hourly_temps = _om['hourly']['temperature_2m']
+_temp_hourly  = pd.Series(_hourly_temps, index=_hourly_idx, dtype=float)
+
+# Interpolate to 5-minute resolution to cover any sub-hourly timestamps
+temp_series = _temp_hourly.resample('5min').interpolate(method='time')
 
 # ---------------------------------------------------------------------------------
 
@@ -69,7 +103,7 @@ all_branch  = []
 all_viol    = []
 all_thermal = []
 
-for timestamp in forecast_ts['timestamp'].unique():
+for timestamp in _ts_sorted:
     logging.info(f"--- Solving timestep {timestamp} ---")
 
     forecast_t = (
@@ -77,6 +111,8 @@ for timestamp in forecast_ts['timestamp'].unique():
                         ['load_id', 'real_power_w', 'reactive_power_var']]
         .set_index('load_id')
     )
+
+    theta_A = temp_series.loc[timestamp]
 
     solver = csoe.DoeSolver(
         netw, forecast_t,
