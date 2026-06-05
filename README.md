@@ -1,5 +1,13 @@
 # converge-soe: SOE optimisation engine as used in Project Converge
+# Edits as per honours topic: implementing thermal constrained modelling to SOEs. 
+This repo is using the converge-soe framework as a base to build a model that can use thermal modelling of transformers to further optimise DOE allocation and allow for increased PV penetration.
 
+It seeks to answer the question: "What is the regulatory cost benefit of thermally aware Dynamic Operating Envelopes as a mechanism for managing DPV-driven transformer ageing in ACT low-voltage networks?" 
+
+The converge-soe model will be used to create a simpler DOE model,and then test cases constructed to determine potential benefits of DOEs with thermal constraints compared to DOEs without. 
+
+
+# Original converge-soe README:
 converge-soe is a python package that implements the shared operating envelope (SOE) optimisation as used in [Project Converge](https://arena.gov.au/projects/project-converge-act-distributed-energy-resources-demonstration-pilot/). It is an open-source version of the code that was tested during the project.
 
 ## Prerequisites
