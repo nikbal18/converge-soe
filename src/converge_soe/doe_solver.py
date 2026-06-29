@@ -507,7 +507,9 @@ class SoeSolver:
 
                     # Ultimate temperature rises — IEEE C57.91 exact form
                     delta_TO_U = dTO_R * ((K2 * R + 1) / (R + 1)) ** n
-                    delta_HS_U = dHS_R * K2 ** m
+                    eps = 1e-6
+                    delta_HS_U = dHS_R * (K2 + eps) ** m
+
 
                     # Step-response (exact discretisation of the first-order ODEs)
                     delta_TO = (delta_TO_U - dTO_0) * alpha_TO + dTO_0

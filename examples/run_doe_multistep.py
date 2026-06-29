@@ -133,7 +133,7 @@ for timestamp in _ts_sorted:
 
     # Stamp each result frame with the current timestep and accumulate
     for df, store in [
-        (results.doe,    all_doe),
+        (results.soe,    all_doe),
         (results.bus,    all_bus),
         (results.branch, all_branch),
         (results.viol,   all_viol),

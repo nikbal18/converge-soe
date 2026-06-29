@@ -3,6 +3,7 @@ NOTICE
 README.md
 pyproject.toml
 src/converge_soe/__init__.py
+src/converge_soe/doe_solver.py
 src/converge_soe/soe_solver.py
 src/converge_soe.egg-info/PKG-INFO
 src/converge_soe.egg-info/SOURCES.txt

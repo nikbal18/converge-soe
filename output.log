@@ -1,0 +1,30 @@
+/home/n_ballinger/project/.venv/converge-soe/examples/run_doe_multistep.py:60: UserWarning: Could not infer format, so each element will be parsed individually, falling back to `dateutil`. To ensure parsing is consistent and as-expected, please specify a format.
+  forecast_ts['timestamp'] = pd.to_datetime(forecast_ts['timestamp'])
+INFO:root:Fetching Open-Meteo temperature for (-35.2035, 149.1548) 2026-06-29 → 2026-06-29
+INFO:root:--- Solving timestep 2026-06-29 07:00:00 ---
+INFO:converge_soe.doe_solver:Ipopt 3.14.19: print_level=3
+linear_solver=mumps
+
+INFO:converge_soe.doe_solver:Error evaluating constraint 7 gradient: can't evaluate pow'(0,0.8).
+
+INFO:converge_soe.doe_solver:
+
+******************************************************************************
+This program contains Ipopt, a library for large-scale nonlinear optimization.
+ Ipopt is released as open source code under the Eclipse Public License (EPL).
+         For more information visit https://github.com/coin-or/Ipopt
+******************************************************************************
+
+
+ERROR:pyomo.opt:Solver (ipopt) returned non-zero return code (1)
+ERROR:pyomo.opt:See the solver log above for diagnostic information.
+Traceback (most recent call last):
+  File "/home/n_ballinger/project/.venv/converge-soe/examples/run_doe_multistep.py", line 125, in <module>
+    status, results = solver.solve()
+  File "/home/n_ballinger/project/.venv/converge-soe/src/converge_soe/doe_solver.py", line 87, in solve
+    status = self._solve_opt_model()
+  File "/home/n_ballinger/project/.venv/converge-soe/src/converge_soe/doe_solver.py", line 548, in _solve_opt_model
+    results = solver.solve(self.model, tee=True)  # tee=True to see solver output
+  File "/home/n_ballinger/NAP/.venv/lib/python3.10/site-packages/pyomo/opt/base/solvers.py", line 657, in solve
+    raise ApplicationError("Solver (%s) did not exit normally" % self.name)
+pyomo.common.errors.ApplicationError: Solver (ipopt) did not exit normally
