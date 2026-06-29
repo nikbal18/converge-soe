@@ -1,3 +1,5 @@
 __pycache__/
 *.pyc
 .egg-info/
+examples/scenario_2/forecast_timeseries.csv
+examples/scenario_2/network.json
