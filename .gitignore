@@ -4,3 +4,4 @@ __pycache__/
 examples/scenario_2/forecast_timeseries.csv
 examples/scenario_2/network.json
 network_conversion/*.json
+network_conversion/*.json
