@@ -520,8 +520,21 @@ def build_network(data, args):
         if n in node_xy:
             nd["xy"] = [node_xy[n][0] - ACT_GRID_FALSE_E, node_xy[n][1] - ACT_GRID_FALSE_N]
             nd["lat_long"] = to_latlong(node_xy[n])
-        if v < 1000.0 and args.lv_vmin and args.lv_vmax:
-            nd["user_data"] = {"v_min": args.lv_vmin, "v_max": args.lv_vmax}
+        if v < 1000.0:
+            if args.lv_vmin and args.lv_vmax:
+                # Explicit absolute band (kV) overrides everything.
+                nd["user_data"] = {"v_min": args.lv_vmin, "v_max": args.lv_vmax}
+            elif args.lv_voltage_tolerance and args.lv_voltage_tolerance > 0:
+                # Default: +/- tolerance around a nominal voltage. If
+                # --lv-nominal-v is given (phase volts) it references that;
+                # otherwise each node's own base voltage is the nominal.
+                tol = args.lv_voltage_tolerance
+                if args.lv_nominal_v:
+                    nom_kv = args.lv_nominal_v * math.sqrt(3) / 1000.0  # phase V -> line-line kV
+                else:
+                    nom_kv = round(v / 1000.0, 6)
+                nd["user_data"] = {"v_min": round(nom_kv * (1 - tol), 6),
+                                   "v_max": round(nom_kv * (1 + tol), 6)}
         comps[nid_out(n)] = {"Node": nd}
 
     # Infeeder
@@ -648,16 +661,24 @@ def build_network(data, args):
 
     n_loads = 0
     if data["usage_points"]:
-        for nmi, up in sorted(data["usage_points"].items()):
+        for up_id, up in sorted(data["usage_points"].items()):
             sl = data["service_locs"].get(up["service_loc"] or "", {})
             node = data["terminal_node"].get(sl.get("terminal") or "")
             if node not in used_nodes:
                 warnings["load_unplaced"] += 1
                 continue
-            ud = {"nmi": nmi, "nmis": [nmi], "load_group": up["load_group"],
+            # DMS UsagePoint ids are the 10-digit market NMI plus an 11th
+            # checksum digit. Strip it (unless --keep-nmi-checksum) so load ids
+            # match interval-meter NMIs. Keep the raw id in user_data.
+            if not args.keep_nmi_checksum and len(up_id) == 11 and up_id.isdigit():
+                nmi = up_id[:10]
+            else:
+                nmi = up_id
+            ud = {"nmi": nmi, "nmis": [nmi], "usage_point_id": up_id,
+                  "load_group": up["load_group"],
                   "type": sl.get("desc"), "phase": up["phase"]}
-            if ders_by_nmi.get(nmi):
-                ud["der"] = ders_by_nmi[nmi]
+            if ders_by_nmi.get(up_id):
+                ud["der"] = ders_by_nmi[up_id]
             comps[f"nmi_{nmi}"] = {"Load": {
                 "cons": [{"node": nid_out(node), "phs": PH}],
                 "in_service": True,
@@ -750,11 +771,20 @@ def main():
     p.add_argument("--v-setpoint-pu", type=float, default=1.05,
                    help="infeeder voltage setpoint in pu (default 1.05)")
     p.add_argument("--lv-vmin", type=float, default=None,
-                   help="LV node v_min in kV, e.g. 0.39 (optional)")
+                   help="explicit LV node v_min in kV, e.g. 0.36 (absolute override)")
     p.add_argument("--lv-vmax", type=float, default=None,
-                   help="LV node v_max in kV, e.g. 0.44 (optional)")
+                   help="explicit LV node v_max in kV, e.g. 0.44 (absolute override)")
+    p.add_argument("--lv-voltage-tolerance", type=float, default=0.10,
+                   help="LV nodes get v_min/v_max = nominal*(1-/+tol). "
+                        "Default 0.10 (+/-10%%). Pass 0 to disable voltage limits.")
+    p.add_argument("--lv-nominal-v", type=float, default=None,
+                   help="LV nominal PHASE voltage in V to centre the tolerance band "
+                        "on (e.g. 230). Default: each node's own base voltage.")
     p.add_argument("--source-node", default=None,
                    help="node id of feeder head if no stitchingInfo=FH node exists")
+    p.add_argument("--keep-nmi-checksum", action="store_true",
+                   help="keep the full 11-digit UsagePoint id instead of "
+                        "stripping the trailing NMI checksum digit")
     args = p.parse_args()
 
     data = merge_data([parse_cim(x) for x in args.xml])

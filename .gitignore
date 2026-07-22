@@ -1,7 +1,39 @@
+# Python
 __pycache__/
 *.pyc
+*.egg-info/
 .egg-info/
+
+# ---------------------------------------------------------------------------
+# CONFIDENTIAL — never commit to this public repo
+# Real EvoEnergy network models and customer/NMI data, and anything derived
+# from them. If you add new real-data files, extend these patterns.
+# ---------------------------------------------------------------------------
+
+# Raw CIM/DMS network exports (network topology + customer UsagePoints/NMIs)
+*.xml
+
+# Converted network models built from real exports (topology + placed NMIs)
+*_network.json
+*_lv_network.json
+GOLDCR_*.json
+LEXCEN_*.json
+network_conversion/*.json
+
+# Real interval-meter / NMI data and anything derived from it
+examples/scenario_2/data_translation/lexcen_data.csv
+examples/scenario_2/data_translation/project_format.csv
 examples/scenario_2/forecast_timeseries.csv
 examples/scenario_2/network.json
-network_conversion/*.json
-network_conversion/*.json
+
+# Solver run outputs (rows keyed by nmi_<NMI>)
+out/
+results/
+**/curtailment_report.csv
+**/feeder_summary.csv
+
+# Local working folders for real data (keep inputs here, out of git)
+data/
+
+# Local run guide that references real feeder/substation names — keep private
+examples/RUN_DOE_GUIDE.md

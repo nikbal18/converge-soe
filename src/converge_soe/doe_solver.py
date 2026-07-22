@@ -645,7 +645,9 @@ class SoeSolver:
                 dHS_0  = prev.get('delta_theta_HS', 0.0)
 
                 # Both oe scenarios have equal current with fixed loads; use 'oel' arbitrarily
-                K2_val     = self.model.square_current_pu[tx_id, 'oel'].value * c2
+                # Clamp to >=0: solver can return tiny negative current (numerical
+                # noise), and a negative base to a fractional power is complex.
+                K2_val     = max(self.model.square_current_pu[tx_id, 'oel'].value * c2, 0.0)
                 delta_TO_U = dTO_R * ((K2_val * R + 1) / (R + 1)) ** n
                 delta_HS_U = dHS_R * K2_val ** m
 
