@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 *.egg-info/
 .egg-info/
+.venv/
 
 # ---------------------------------------------------------------------------
 # CONFIDENTIAL — never commit to this public repo
@@ -18,22 +19,34 @@ __pycache__/
 *_lv_network.json
 GOLDCR_*.json
 LEXCEN_*.json
+S5402*.json
 network_conversion/*.json
 
 # Real interval-meter / NMI data and anything derived from it
+examples/scenario_2/
 examples/scenario_2/data_translation/lexcen_data.csv
 examples/scenario_2/data_translation/project_format.csv
 examples/scenario_2/forecast_timeseries.csv
 examples/scenario_2/network.json
 
-# Solver run outputs (rows keyed by nmi_<NMI>)
+# All pipeline inputs (real meter/NMI data, XMLs, mappings, ambient caches).
+# The folder structure itself is documented via the committed READMEs.
+data/
+!data/**/README.md
+
+# Derived, regenerable
+build/
+
+# Results (rows keyed by nmi_<NMI>) and old run outputs
 out/
 results/
 **/curtailment_report.csv
 **/feeder_summary.csv
 
-# Local working folders for real data (keep inputs here, out of git)
-data/
+# Archived originals (old generated outputs from real data live here)
+archive/
 
 # Local run guide that references real feeder/substation names — keep private
+# (both the pre-reorg and post-reorg locations)
 examples/RUN_DOE_GUIDE.md
+examples/legacy/RUN_DOE_GUIDE.md
