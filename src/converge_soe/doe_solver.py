@@ -5,8 +5,11 @@ import logging
 from pyomo.environ import (
     ConcreteModel, ConstraintList, NonNegativeReals, Objective, minimize, pyomo, Reals, SolverFactory, Var
 )
+from pyomo.common.errors import ApplicationError
 import numpy as np
 import pandas as pd
+
+from . import thermal as _thermal
 
 
 logger = logging.getLogger(__name__)
@@ -44,7 +47,13 @@ class SoeSolver:
                  df_prices: pd.DataFrame = None,
                  transformer_params: dict = None,
                  theta_A: float = 20.0, thermal_state_in: dict = None,
-                 solver_options: dict = {}):
+                 solver_options: dict = {},
+                 tx_limit: str = "legacy",
+                 k_emergency: float = 2.0, k2_floor: float = 1e-6,
+                 soft_limits: bool = False, soft_limit_penalty: float = 1000.0,
+                 quiet: bool = False, warm_start_in: dict = None,
+                 solver_name: str = "ipopt", network_cache=None,
+                 usable_export_weight: float = 0.0):
         self.netw_ejson = netw_ejson
         self.netw_ejson["components"] = dict(sorted(self.netw_ejson["components"].items()))  # For reprod/testing
         # pandas df with forecast power consumption for each customer.
@@ -65,6 +74,51 @@ class SoeSolver:
         # Each value is a dict with 'delta_theta_TO' and 'delta_theta_HS' (°C).
         # Defaults to cold start (0 °C rises) for any transformer not present.
         self.thermal_state_in = thermal_state_in if thermal_state_in is not None else {}
+        # Transformer current-limit mode:
+        #   "legacy" — today's combined behaviour: static s_max-derived i_max_pu
+        #              PLUS the nonlinear C57.91 hot-spot constraint (kept only
+        #              so the Phase-9 equivalence tests have a reference).
+        #   "dtr"    — the transformer i_max_pu is REPLACED by the inverted
+        #              C57.91 dynamic thermal rating for this timestep, and the
+        #              nonlinear hot-spot constraint is removed entirely.
+        #   "static" — s_max-derived i_max_pu, no thermal constraint in the
+        #              optimisation (thermal state still tracked post-hoc).
+        if tx_limit not in ("legacy", "dtr", "static"):
+            raise ValueError(f"tx_limit must be legacy|dtr|static, got {tx_limit!r}")
+        if tx_limit == "dtr" and transformer_params is None:
+            raise ValueError("tx_limit='dtr' requires transformer_params")
+        self.tx_limit = tx_limit
+        # Emergency backstop: bushings/tap changers/LV cabling cap the rating at
+        # K_emergency x rated current no matter how cold the oil is.
+        self.k_emergency = float(k_emergency)
+        self.k2_floor = float(k2_floor)
+        # Optional penalised slacks on voltage and current limits (MDL001): an
+        # infeasible interval becomes a quantified violation instead of a
+        # missing row. OFF by default for backwards compatibility.
+        self.soft_limits = bool(soft_limits)
+        self.soft_limit_penalty = float(soft_limit_penalty)
+        # Silence ipopt (Phase 3): print_level=0, no stdout redirection.
+        self.quiet = bool(quiet)
+        # Optional warm start: dict of {var_name: {index: value}} from the
+        # previous timestep's solution (see warm_start_values()).
+        self.warm_start_in = warm_start_in or {}
+        # Per-transformer DTR record for this timestep (populated in
+        # _build_network_data when tx_limit == "dtr").
+        self.dtr_info = {}
+        self.solver_name = solver_name
+        # Weight ($/kWh-ish) on the "usable export" reward: an auxiliary
+        # variable u_i = min(doe_ub_i, max(P_des_i, 0)) is rewarded in the
+        # objective, so envelope headroom is allocated to customers who can
+        # actually use it. With weight 0 (the default, and the legacy
+        # behaviour) the per-NMI allocation of surplus network capacity is
+        # DEGENERATE — mathematically any split is optimal, so curtailment
+        # metrics become arbitrary. The pipeline scenarios enable this.
+        self.usable_export_weight = float(usable_export_weight)
+        # Optional pre-parsed network data (Path A of the speed work): the
+        # network is constant for a given substation, so the ejson parse and
+        # per-unit conversion can be done once and reused for every timestep.
+        # Obtain one from a first solver instance via .network_cache().
+        self._network_cache_in = network_cache
         # Solver options defaults
         self.solver_options = {'print_level': 3, 'linear_solver': 'mumps'}
 
@@ -114,8 +168,42 @@ class SoeSolver:
         else:
             self.partic_prices = pd.Series(0.0, index=self.partic_load_ids)
 
+    def network_cache(self):
+        '''Reusable parsed network data for subsequent DoeSolver instances.
+
+        Pass as ``network_cache=`` to skip the ejson parse and per-unit
+        conversion on every timestep (the network is constant per substation).
+        '''
+        return {
+            "buses": self.buses,
+            "branches": self._branches_pristine,
+            "loads": self.loads,
+            "load_buses": self.load_buses,
+            "transformer_buses": self.transformer_buses,
+            "downstream": self._downstream,
+        }
+
+    def _apply_cached_network(self, cache):
+        self.buses = cache["buses"]
+        # branches are copied because DTR mode overwrites transformer i_max_pu
+        # per timestep; everything else is shared read-only.
+        self._branches_pristine = cache["branches"]
+        self.branches = cache["branches"].copy()
+        self.loads = cache["loads"]
+        self.load_buses = cache["load_buses"]
+        self.transformer_buses = cache["transformer_buses"]
+        self._downstream = cache["downstream"]
+
     def _build_network_data(self):
-        #builds a dataframe for each bus, branch and loads. Converts everything to pu terms. 
+        #builds a dataframe for each bus, branch and loads. Converts everything to pu terms.
+        if self._network_cache_in is not None:
+            self._apply_cached_network(self._network_cache_in)
+            self._apply_dtr_limits()
+            sel_lines = self.branches["voltage_ratio_pu"].isna()
+            self.lines = self.branches.loc[sel_lines]
+            self.transformers = self.branches.loc[~sel_lines]
+            return
+        
         v_units = self.netw_ejson["units"]["voltage"]
         i_units = self.netw_ejson["units"]["current"]
         s_units = self.netw_ejson["units"]["power"]
@@ -265,9 +353,47 @@ class SoeSolver:
 
         build_branch_base_and_pu(self.branches)
 
+        # Keep a pristine copy (pre-DTR) plus the downstream-branch map for
+        # network_cache() reuse across timesteps (Path A of the speed work).
+        self._branches_pristine = self.branches.copy()
+        self._downstream = {}
+        for b_id, from_bus in self.branches["from_bus_id"].items():
+            self._downstream.setdefault(from_bus, []).append(b_id)
+
+        self._apply_dtr_limits()
+
         sel_lines = self.branches["voltage_ratio_pu"].isna()
         self.lines = self.branches.loc[sel_lines]
         self.transformers = self.branches.loc[~sel_lines]
+
+    def _apply_dtr_limits(self):
+        # Dynamic thermal rating (Phase 1): replace each transformer's static
+        # nameplate i_max_pu with the limit obtained by inverting the C57.91
+        # model for THIS timestep's thermal state and ambient temperature.
+        # The nonlinear hot-spot constraint is then omitted from the model
+        # entirely — the transformer limit is a simple bound.
+        if self.tx_limit == "dtr" and self.transformer_params is not None:
+            tp = self.transformer_params
+            k2_emergency = self.k_emergency ** 2
+            sel_tx = self.branches["voltage_ratio_pu"].notna()
+            for tx_id in self.branches.index[sel_tx]:
+                i_base_a = self.branches.at[tx_id, "i_base_a"]
+                c2 = (i_base_a / tp["I_rated"]) ** 2
+                prev = self.thermal_state_in.get(tx_id, {})
+                dTO_0 = prev.get("delta_theta_TO", 0.0)
+                dHS_0 = prev.get("delta_theta_HS", 0.0)
+                i_max_pu, status = _thermal.dtr_current_limit_pu(
+                    tp, self.theta_A, dTO_0, dHS_0, c2,
+                    k2_emergency=k2_emergency, k2_floor=self.k2_floor,
+                )
+                self.branches.at[tx_id, "i_max_pu"] = i_max_pu
+                self.branches.at[tx_id, "i_max_a"] = i_max_pu * i_base_a
+                self.dtr_info[tx_id] = {
+                    "i_max_pu": i_max_pu,
+                    "K2_max": i_max_pu ** 2 * c2,
+                    "status": status,
+                    "c2": c2,
+                }
 
     def _build_opt_model(self):
         #uses pyomo to build the actual optimization model. This includes:
@@ -299,20 +425,39 @@ class SoeSolver:
 
         # Variables --------------------------------------------------------------------------------------------------
 
-        # Network variables
-        # All being setup with initial values
+        # Network variables.
+        # Bounds (Phase 1.4): physically generous, numerically essential —
+        # square_voltage_pu in [0.5^2, 1.5^2] and square_current_pu >= 1e-8
+        # keep ipopt away from the pow(0, 0.8)-style singularities.
+        # Initial values come from the previous timestep's solution when the
+        # caller passes warm_start_in (consecutive intervals are similar), and
+        # fall back to flat-start values otherwise.
+        ws = self.warm_start_in
+
+        def init_from(ws_key, fallback):
+            prev = ws.get(ws_key) or {}
+            def _init(m, *idx):
+                return prev.get(idx if len(idx) > 1 else idx[0], fallback)
+            return _init
+
         self.model.square_voltage_pu = Var(
-            bus_oe_idxs, name="square_voltage_pu", domain=NonNegativeReals, initialize=1.0
+            bus_oe_idxs, name="square_voltage_pu", domain=NonNegativeReals,
+            bounds=(0.5 ** 2, 1.5 ** 2),
+            initialize=init_from("square_voltage_pu", 1.0)
         )
 
         self.model.square_current_pu = Var(
-            branch_oe_idxs, name="square_current_pu", domain=NonNegativeReals, initialize=0.0
+            branch_oe_idxs, name="square_current_pu", domain=NonNegativeReals,
+            bounds=(1e-8, None),
+            initialize=init_from("square_current_pu", 1e-8)
         )
         self.model.branch_active_pu = Var(
-            branch_oe_idxs, name="branch_active_pu", domain=Reals, initialize=0.0
+            branch_oe_idxs, name="branch_active_pu", domain=Reals,
+            initialize=init_from("branch_active_pu", 0.0)
         )
         self.model.branch_reactive_pu = Var(
-            branch_oe_idxs, name="branch_reactive_pu", domain=Reals, initialize=0.0
+            branch_oe_idxs, name="branch_reactive_pu", domain=Reals,
+            initialize=init_from("branch_reactive_pu", 0.0)
         )
 
         # Operating envelope variables. These are power *injections*.
@@ -397,6 +542,18 @@ class SoeSolver:
 
         self.model.c = ConstraintList()
 
+        # Optional slacks on the (otherwise hard) voltage and current limits
+        # (MDL001). With soft limits an over-limit interval solves anyway and
+        # the violation magnitude is reported, instead of the timestep silently
+        # disappearing as "infeasible".
+        if self.soft_limits:
+            self.model.viol_v_pu = Var(
+                bus_oe_idxs, name="viol_v_pu", domain=NonNegativeReals, initialize=0.0
+            )
+            self.model.viol_i_pu = Var(
+                branch_oe_idxs, name="viol_i_pu", domain=NonNegativeReals, initialize=0.0
+            )
+
         # Power flow constraints
 
         # Voltage
@@ -409,11 +566,23 @@ class SoeSolver:
                         self.model.square_voltage_pu[bus_id, oe] == pow(bus_row.v_mag_setpoint_pu, 2)
                     )
                 else:
-                    if pd.notna(bus_row.v_mag_max_pu):
-                        self.model.c.add(self.model.square_voltage_pu[bus_id, oe] <= bus_row.v_mag_max_pu**2)
+                    if self.soft_limits:
+                        if pd.notna(bus_row.v_mag_max_pu):
+                            self.model.c.add(
+                                self.model.square_voltage_pu[bus_id, oe]
+                                <= bus_row.v_mag_max_pu**2 + self.model.viol_v_pu[bus_id, oe]
+                            )
+                        if pd.notna(bus_row.v_mag_min_pu):
+                            self.model.c.add(
+                                self.model.square_voltage_pu[bus_id, oe]
+                                >= bus_row.v_mag_min_pu**2 - self.model.viol_v_pu[bus_id, oe]
+                            )
+                    else:
+                        if pd.notna(bus_row.v_mag_max_pu):
+                            self.model.c.add(self.model.square_voltage_pu[bus_id, oe] <= bus_row.v_mag_max_pu**2)
 
-                    if pd.notna(bus_row.v_mag_min_pu):
-                        self.model.c.add(self.model.square_voltage_pu[bus_id, oe] >= bus_row.v_mag_min_pu**2)
+                        if pd.notna(bus_row.v_mag_min_pu):
+                            self.model.c.add(self.model.square_voltage_pu[bus_id, oe] >= bus_row.v_mag_min_pu**2)
 
         # Power flow
         # power in = power out. 
@@ -424,7 +593,9 @@ class SoeSolver:
                 from_bus_id = branch_row.from_bus_id
 
                 # Line active is active injection into branch.
-                downstream_branch_ids = self.branches.loc[self.branches["from_bus_id"] == to_bus_id].index
+                # (precomputed once — the old per-branch DataFrame scan was
+                # O(B²) across the whole constraint build)
+                downstream_branch_ids = self._downstream.get(to_bus_id, [])
                 # active power into a branch equals load at the destination plus resistive losses plus flows onto downstream branches. 
                 self.model.c.add(
                     self.model.branch_active_pu[branch_id, oe] == sum(a_bus_pu[to_bus_id, oe]) +
@@ -471,13 +642,23 @@ class SoeSolver:
 
                 #current in a cable can't exceed rated maximum.
                 if pd.notna(branch_row.i_max_pu):
-                    self.model.c.add(self.model.square_current_pu[branch_id, oe] <= branch_row.i_max_pu**2)
+                    if self.soft_limits:
+                        self.model.c.add(
+                            self.model.square_current_pu[branch_id, oe]
+                            <= branch_row.i_max_pu**2 + self.model.viol_i_pu[branch_id, oe]
+                        )
+                    else:
+                        self.model.c.add(self.model.square_current_pu[branch_id, oe] <= branch_row.i_max_pu**2)
         # everything is squared here, because working with V^2 and I^2 keeps the constraints in a form that avoids square roots.
 
         # Transformer thermal constraints (IEEE C57.91) --------------------------------------------------------------
-        # Exact exponential step-response discretisation of the two-layer ODE.
-        # With n=m=1 (linearised) the constraint is linear in square_current_pu.
-        if self.transformer_params is not None:
+        # LEGACY MODE ONLY. In "dtr" mode the thermal model is inverted into a
+        # time-varying bound on square_current_pu (see _build_network_data) and
+        # this nonlinear constraint is removed entirely; in "static" mode the
+        # thermal model plays no part in the optimisation. Keeping the combined
+        # constraint here under tx_limit="legacy" gives the Phase-9 equivalence
+        # tests a reference for A/B comparison.
+        if self.tx_limit == "legacy" and self.transformer_params is not None:
             tp = self.transformer_params
             R            = tp['R']
             n            = tp['n']
@@ -539,16 +720,65 @@ class SoeSolver:
             for bus_id in self.load_buses for oe in _oe_idxs for ci in _ci_idxs
         )
 
+        # Usable-export reward (see __init__): u_i <= ub_i, u_i <= P_des_i+.
+        if self.usable_export_weight > 0:
+            p_des_pos = {
+                lid: max(-self.df_forecasts_filt.loc[lid, "real_power_w"] / 1000.0, 0.0)
+                if lid in self.df_forecasts_filt.index else 0.0
+                for lid in self.partic_load_ids
+            }
+            self.model.usable_export_kw = Var(
+                self.partic_load_ids, name="usable_export_kw",
+                domain=NonNegativeReals, initialize=0.0)
+            for lid in self.partic_load_ids:
+                self.model.c.add(self.model.usable_export_kw[lid]
+                                 <= self.model.p_inj_oe_kw[lid, 'oer'])
+                self.model.c.add(self.model.usable_export_kw[lid]
+                                 <= p_des_pos[lid])
+            width_term = width_term - self.usable_export_weight * sum(
+                self.model.usable_export_kw[lid] for lid in self.partic_load_ids)
+
+        # Penalty on the soft voltage/current limit slacks (MDL001). Scaled by
+        # the same order as the power-balance slacks so violations are used
+        # only as a last resort but still solve.
+        if self.soft_limits:
+            viol_term = viol_term + self.soft_limit_penalty * (
+                sum(self.model.viol_v_pu[i] for i in self.model.viol_v_pu)
+                + sum(self.model.viol_i_pu[i] for i in self.model.viol_i_pu)
+            )
+
         self.model.value = Objective(expr=benefit_term + width_term + viol_term, sense=minimize)
     #this is the IPOPT solver instance, calling the solver. 
     def _solve_opt_model(self):
-        solver = SolverFactory("ipopt")
+        solver = SolverFactory(self.solver_name)
         for k, v in self.solver_options.items():
             solver.options[k] = v
 
-        with contextlib.redirect_stdout(OutputLogger(logger, logging.INFO)):
-            results = solver.solve(self.model, tee=True)  # tee=True to see solver output
+        if self.quiet:
+            # No stdout redirection, no banner, no iteration output. The string
+            # formatting through the logging machinery on every solve is
+            # measurable overhead across tens of thousands of timesteps.
+            solver.options['print_level'] = 0
+            solver.options['sb'] = 'yes'
+            solver.options['file_print_level'] = 0
+            try:
+                results = solver.solve(self.model, tee=False)
+            except (ApplicationError, ValueError, OSError) as e:
+                # One bad interval must never kill a year-long run: record and
+                # report as an error status; the caller logs and continues.
+                self.last_solve_error = f"{type(e).__name__}: {e}"
+                logger.error("solver failed: %s", self.last_solve_error)
+                return pyomo.opt.SolverStatus.error
+        else:
+            with contextlib.redirect_stdout(OutputLogger(logger, logging.INFO)):
+                try:
+                    results = solver.solve(self.model, tee=True)  # tee=True to see solver output
+                except (ApplicationError, ValueError, OSError) as e:
+                    self.last_solve_error = f"{type(e).__name__}: {e}"
+                    logger.error("solver failed: %s", self.last_solve_error)
+                    return pyomo.opt.SolverStatus.error
 
+        self.last_solve_error = None
         return results['Solver'][0].status
     #reads solved variables back out into df. 
     def _extract_results(self):
@@ -624,16 +854,12 @@ class SoeSolver:
         results_soe = pd.DataFrame.from_records(recs).set_index("load_id").round(6) if len(recs) > 0 else pd.DataFrame()
 
         # Transformer thermal state output — pass as thermal_state_in to the next period
+        # (advanced with the ACTUAL solved current; the recursion is identical
+        # in every tx_limit mode — only where the constraint is applied moved).
         thermal_state_out = {}
         if self.transformer_params is not None:
-            tp       = self.transformer_params
-            R        = tp['R'];  n = tp['n'];  m = tp['m']
-            dTO_R    = tp['delta_theta_TO_R']
-            dHS_R    = tp['delta_theta_HS_R']
-            I_rated  = tp['I_rated']
-            dt       = tp['dt']
-            alpha_TO = 1.0 - np.exp(-dt / tp['tau_TO'])
-            alpha_W  = 1.0 - np.exp(-dt / tp['tau_W'])
+            tp      = self.transformer_params
+            I_rated = tp['I_rated']
 
             for tx_row in self.transformers.itertuples():
                 tx_id    = tx_row.Index
@@ -644,25 +870,56 @@ class SoeSolver:
                 dTO_0  = prev.get('delta_theta_TO', 0.0)
                 dHS_0  = prev.get('delta_theta_HS', 0.0)
 
-                # Both oe scenarios have equal current with fixed loads; use 'oel' arbitrarily
-                # Clamp to >=0: solver can return tiny negative current (numerical
-                # noise), and a negative base to a fractional power is complex.
-                K2_val     = max(self.model.square_current_pu[tx_id, 'oel'].value * c2, 0.0)
-                delta_TO_U = dTO_R * ((K2_val * R + 1) / (R + 1)) ** n
-                delta_HS_U = dHS_R * K2_val ** m
+                # 'oel' current, as in the original code. NOTE: with envelope
+                # variables in the power flow the two oe scenarios can differ;
+                # oel (max-consumption side) is the conservative choice and is
+                # kept unchanged for backwards compatibility.
+                K2_val = self.model.square_current_pu[tx_id, 'oel'].value * c2
+                st = _thermal.forward_step(tp, K2_val, self.theta_A, dTO_0, dHS_0)
+                thermal_state_out[tx_id] = st
 
-                delta_TO_new = (delta_TO_U - dTO_0) * alpha_TO + dTO_0
-                delta_HS_new = (delta_HS_U - dHS_0) * alpha_W  + dHS_0
-
-                thermal_state_out[tx_id] = {
-                    'delta_theta_TO': delta_TO_new,
-                    'delta_theta_HS': delta_HS_new,
-                    'theta_HS':       self.theta_A + delta_TO_new + delta_HS_new,
-                }
+                # Attach the DTR record for this timestep (evidence the dynamic
+                # rating is doing something — written to thermal.parquet).
+                if tx_id in self.dtr_info:
+                    self.dtr_info[tx_id]['theta_HS'] = st['theta_HS']
+                    self.dtr_info[tx_id]['K2_actual'] = K2_val
 
         return namedtuple("Results", "bus branch viol soe thermal_state")(
             results_bus, results_branch, results_viol, results_soe, thermal_state_out
         )
+    def warm_start_values(self):
+        '''Solved variable values, keyed for the next timestep's warm_start_in.
+
+        Pass the returned dict as ``warm_start_in`` when constructing the
+        solver for the next interval so variables initialise from this
+        solution instead of a flat start.
+        '''
+        out = {}
+        for name in ("square_voltage_pu", "square_current_pu",
+                     "branch_active_pu", "branch_reactive_pu"):
+            var = getattr(self.model, name)
+            out[name] = {idx: var[idx].value for idx in var
+                         if var[idx].value is not None}
+        return out
+
+    def extract_soft_violations(self, tol=1e-6):
+        '''Nonzero voltage/current soft-limit slacks (needs soft_limits=True).
+
+        Returns a list of dicts: {kind: 'voltage'|'current', id, oe, viol_pu}.
+        '''
+        rows = []
+        if not self.soft_limits:
+            return rows
+        for (bid, oe) in self.model.viol_v_pu:
+            v = self.model.viol_v_pu[bid, oe].value
+            if v is not None and v > tol:
+                rows.append({"kind": "voltage", "id": bid, "oe": oe, "viol_pu": v})
+        for (bid, oe) in self.model.viol_i_pu:
+            v = self.model.viol_i_pu[bid, oe].value
+            if v is not None and v > tol:
+                rows.append({"kind": "current", "id": bid, "oe": oe, "viol_pu": v})
+        return rows
+
     # this is called at the start of the model, which pre-computes background load at each bus before the optimization model is built. 
     def _calculate_bus_loads_kw(self, bus_idxs):
         '''
