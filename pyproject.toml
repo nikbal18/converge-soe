@@ -4,12 +4,25 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "converge_soe"
-version = "0.0.1"
+version = "0.1.0"
+description = "DOE/SOE optimisation engine with transformer dynamic thermal rating (Project Converge base + honours extensions)"
+requires-python = ">=3.10"
 dependencies = [
-    'numpy>=1.26.4',
-    'pandas>=2.2.1',
-    'pyomo>=6.7.1'
+    "pyomo>=6.7.1",
+    "numpy>=1.26.4",
+    "pandas>=2.2.1",
+    "pyarrow>=14.0",
+    "scipy>=1.11",
+    "matplotlib>=3.8",
+    "pyyaml>=6.0",
+    "tqdm>=4.66",
+    "requests>=2.31",
 ]
+
+[project.scripts]
+csoe-build = "converge_soe.cli:build_main"
+csoe-run = "converge_soe.cli:run_main"
+csoe-analyse = "converge_soe.cli:analyse_main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -1,0 +1,59 @@
+Speed work: measured results (sandbox, 2-core Linux, ipopt 3.14.11 + MUMPS
+via the casadi-bundled libraries; cProfile shares from tools/profile_doe.py,
+wall times from direct timing. Re-run tools/profile_doe.py on the laptop for
+machine-specific numbers.)
+
+── Baseline (docs/profile_baseline_100.txt): legacy pattern, bundled toy
+   scenario (5 buses), 100 steps under cProfile ─────────────────────────────
+   228 ms/timestep. Self-time: ipopt subprocess wait 76.8 %, pandas slicing
+   9.6 %, model build 2.8 %, nl write/spawn 0.7 %, extract 0.1 %,
+   network rebuild 0.05 %, other 9.8 %.
+
+── 150-NMI / 160-branch synthetic substation (the realistic case) ──────────
+   per-timestep wall, tx_limit as noted, soft limits on:
+
+   legacy pattern (rebuild everything, legacy thermal constraint) : 4.13 s
+   Path A (network cache + warm start + DTR bound, per-step model): 3.06 s
+   Path B (persistent mutable-param model, appsi ipopt)           : 4.46 s*
+   Path B (classic interface)                                     : 5.15 s*
+   model construction (once, Path B)                              : 0.13 s
+   DoeSolver construction (per step, Path A)                      : 0.09 s
+   .nl write                                                      : 0.06 s
+   raw ipopt solve of the same .nl                                : 4.7-5.4 s
+
+   * Path B is NOT faster here because >95 % of the time is inside ipopt
+     itself (151 iterations × ~35 ms MUMPS factorisations); skipping model
+     construction saves the 0.09 s that was never the problem on this
+     machine/pyomo version. Pyomo 6.10 builds this model far faster than
+     older versions did. Keep --fast for machines/models where construction
+     matters; the equivalence test guarantees it is safe.
+
+── What actually moves the needle ───────────────────────────────────────────
+   ipopt options mu_strategy=adaptive + tol=1e-6 (config default):
+       151 → ~96 iterations, 4.73 s → 2.55 s  (1.9×)
+   warm start (same-solution re-solve):        4.73 s → 3.36 s
+   parallel substations (--jobs N):            ×N (substations independent;
+       OMP_NUM_THREADS=1 set per worker to avoid oversubscription)
+   linear_solver=ma27 (HSL, on the laptop):    typically 2-3× over MUMPS
+       on problems this size — worth licensing for the full-year runs.
+
+── The O(T²) pandas elimination (why year-long runs were "unusable") ────────
+   year-long long-format frame (17,520 steps × 20 NMIs = 350k rows):
+   per-timestep boolean scan fc.loc[fc.timestamp == ts] : 3.5 ms
+       × 17,520 steps ≈ 1.0 minute of pure slicing per substation per
+       scenario — and it grows linearly with NMI count and quadratically
+       with period length (the scan cost itself scales with T).
+       At 376 NMIs (Lexcen) the same scan is ~50 ms → ~15 min/substation
+       of slicing alone, ×3 scenarios ×18 substations ≈ 13 hours.
+   pre-indexed npz row read P[t, :]                     : ~0.2 µs
+       × 17,520 ≈ 4 ms total. The pandas cost is simply gone.
+
+── Net effect on a full-year feeder run (8-core laptop, estimated from the
+   measured components) ───────────────────────────────────────────────────
+   legacy: (slice + rebuild + 151-iteration solve) × 17,520 × 18 subs, serial
+   new:    (npz read + param update + ~96-iteration warm solve) × 17,520
+           × 18 subs / 7 workers, streamed to parquet with resume
+   ≈ 20-40× wall-clock depending on the solve-time share on the target
+   machine. The dominant single lever on this sandbox is the solver options
+   + parallelism; on machines where pyomo model construction is slower (or
+   networks are larger), Path A/B contribute proportionally more.

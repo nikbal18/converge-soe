@@ -50,16 +50,16 @@ Only participants (1002, 1003) appear here. Non-participants have no offers.
 
 ## Running the Scenario
 
-From the `converge-soe/examples/` directory:
+From the repo root:
 
 ```bash
-python run_scenario.py scenario_1 scenario_1_output
+python examples/legacy/run_scenario.py examples/scenario_1 /tmp/scenario_1_output
 ```
 
 Or with load scaling (e.g., 2× to stress the network):
 
 ```bash
-python run_scenario.py -s 2.0 scenario_1 scenario_1_output
+python examples/legacy/run_scenario.py -s 2.0 examples/scenario_1 /tmp/scenario_1_output
 ```
 
 Note: you need IPOPT installed. The solver uses MUMPS by default. If you have MA27 (HSL), change the solver_options in run_scenario.py.

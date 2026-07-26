@@ -1,0 +1,51 @@
+DOE solve-loop profile — 100/100 timesteps solved, mode: plain (tx_limit=legacy)
+wall time: 22.82 s  (228.2 ms/timestep)
+
+Self-time by bucket:
+  ipopt_solve         17.53 s    76.8 %
+  other                2.24 s     9.8 %
+  pandas_slice         2.19 s     9.6 %
+  build_model          0.65 s     2.8 %
+  nl_write_spawn       0.17 s     0.7 %
+  extract              0.02 s     0.1 %
+  network_build        0.01 s     0.0 %
+
+Top 30 by cumulative time:
+         7452508 function calls (7311881 primitive calls) in 22.816 seconds
+
+   Ordered by: cumulative time
+   List reduced from 6232 to 30 due to restriction <30>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    0.004    0.004   22.817   22.817 /sessions/eloquent-clever-lamport/work/converge-soe/tools/profile_doe.py:83(run_plain)
+      100    0.002    0.000   19.376    0.194 /sessions/eloquent-clever-lamport/work/converge-soe/src/converge_soe/doe_solver.py:126(solve)
+      100    0.001    0.000   18.370    0.184 /sessions/eloquent-clever-lamport/work/converge-soe/src/converge_soe/doe_solver.py:674(_solve_opt_model)
+      100    0.005    0.000   18.363    0.184 /sessions/eloquent-clever-lamport/.local/lib/python3.10/site-packages/pyomo/opt/base/solvers.py:560(solve)
+      100    0.002    0.000   17.677    0.177 /sessions/eloquent-clever-lamport/.local/lib/python3.10/site-packages/pyomo/opt/solver/shellcmd.py:244(_apply_solver)
+      100    0.004    0.000   17.672    0.177 /sessions/eloquent-clever-lamport/.local/lib/python3.10/site-packages/pyomo/opt/solver/shellcmd.py:307(_execute_command)
+      100    0.001    0.000   17.610    0.176 /usr/lib/python3.10/subprocess.py:461(run)
+      100    0.000    0.000   17.530    0.175 /usr/lib/python3.10/subprocess.py:1110(communicate)
+      200    0.000    0.000   17.529    0.088 /usr/lib/python3.10/subprocess.py:1204(wait)
+      200    0.001    0.000   17.529    0.088 /usr/lib/python3.10/subprocess.py:1927(_wait)
+      100    0.001    0.000   17.527    0.175 /usr/lib/python3.10/subprocess.py:1914(_try_wait)
+      100   17.527    0.175   17.527    0.175 {built-in method posix.waitpid}
+      100    0.001    0.000    2.421    0.024 /sessions/eloquent-clever-lamport/work/converge-soe/src/converge_soe/doe_solver.py:45(__init__)
+      100    0.001    0.000    2.420    0.024 /sessions/eloquent-clever-lamport/work/converge-soe/src/converge_soe/doe_solver.py:117(rebuild)
+      100    0.058    0.001    1.351    0.014 /sessions/eloquent-clever-lamport/work/converge-soe/src/converge_soe/doe_solver.py:340(_build_opt_model)
+13600/13400    0.041    0.000    1.336    0.000 /usr/local/lib/python3.10/dist-packages/pandas/core/indexing.py:1177(__getitem__)
+     1100    0.014    0.000    1.079    0.001 /usr/local/lib/python3.10/dist-packages/pandas/core/frame.py:1568(itertuples)
+      100    0.009    0.000    1.031    0.010 /sessions/eloquent-clever-lamport/work/converge-soe/src/converge_soe/doe_solver.py:157(_build_network_data)
+      100    0.024    0.000    1.005    0.010 /sessions/eloquent-clever-lamport/work/converge-soe/src/converge_soe/doe_solver.py:706(_extract_results)
+   1237/4    0.005    0.000    0.878    0.220 <frozen importlib._bootstrap>:1022(_find_and_load)
+   1194/4    0.004    0.000    0.878    0.220 <frozen importlib._bootstrap>:987(_find_and_load_unlocked)
+   1168/3    0.004    0.000    0.878    0.293 <frozen importlib._bootstrap>:664(_load_unlocked)
+   1060/3    0.002    0.000    0.877    0.292 <frozen importlib._bootstrap_external>:877(exec_module)
+   1694/4    0.001    0.000    0.877    0.219 <frozen importlib._bootstrap>:233(_call_with_frames_removed)
+   1478/3    0.028    0.000    0.877    0.292 {built-in method builtins.exec}
+        1    0.000    0.000    0.877    0.877 /sessions/eloquent-clever-lamport/work/converge-soe/src/converge_soe/__init__.py:1(<module>)
+     2441    0.004    0.000    0.847    0.000 {method 'extend' of 'list' objects}
+    11900    0.012    0.000    0.843    0.000 /usr/local/lib/python3.10/dist-packages/pandas/core/frame.py:1639(<genexpr>)
+   367/79    0.001    0.000    0.784    0.010 {built-in method builtins.__import__}
+ 1205/204    0.002    0.000    0.774    0.004 <frozen importlib._bootstrap>:1053(_handle_fromlist)
+
+

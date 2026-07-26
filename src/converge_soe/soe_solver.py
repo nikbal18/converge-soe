@@ -12,7 +12,7 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 #what goes into the solver?
-#netw_json - dictionary describing the physical grid. 
+#netw_json - dictionary describing the physical grid.
 #df_forecasts - for each customer, a df that describes each customer, what power they are expected to consume in the next 5-minute interval
 #df_offers - df - which customers are willing to be dispatched and at what price?
 _s_base_va = 1.0e6
@@ -37,7 +37,7 @@ class OutputLogger:
         pass
 
 #when you create an SoeSolver, it runs filtering of input data, converts the network into clean pandas df, and builds the optimisation using Pyomo.
-## this is a python dictionary describing the physical network, buses, lines, transformers and loads. 
+## this is a python dictionary describing the physical network, buses, lines, transformers and loads.
 class SoeSolver:
     def __init__(self, netw_ejson: dict, df_forecasts: pd.DataFrame, df_offers: pd.DataFrame,
                  envelope_abs_max=50.0, solver_options: dict = {}):
@@ -84,7 +84,7 @@ class SoeSolver:
         self.df_offers_filt = self.df_offers.reindex(self.offer_load_ids)
 
     def _build_network_data(self):
-        #builds a dataframe for each bus, branch and loads. Converts everything to pu terms. 
+        #builds a dataframe for each bus, branch and loads. Converts everything to pu terms.
         v_units = self.netw_ejson["units"]["voltage"]
         i_units = self.netw_ejson["units"]["current"]
         s_units = self.netw_ejson["units"]["power"]
@@ -240,9 +240,9 @@ class SoeSolver:
 
     def _build_opt_model(self):
         #uses pyomo to build the actual optimization model. This includes:
-        #variables: the unknowns the solver will find: envelope bounds, voltages, currents, power flows, network support dispatch. 
-        #constraints - rules the solution must satisfy, eg. basic electronics principles. 
-        #objectives- minimise cost of network support dispatches, with a small push towards wider envelopes and a large penalty for any constraint violations. 
+        #variables: the unknowns the solver will find: envelope bounds, voltages, currents, power flows, network support dispatch.
+        #constraints - rules the solution must satisfy, eg. basic electronics principles.
+        #objectives- minimise cost of network support dispatches, with a small push towards wider envelopes and a large penalty for any constraint violations.
 
         self.model = ConcreteModel()  # pyomo
 
@@ -258,7 +258,7 @@ class SoeSolver:
         partic_oe_idxs = [(load_id, oe) for load_id in partic_idxs for oe in _oe_idxs]
         partic_ci_idxs = [(load_id, ci) for load_id in partic_idxs for ci in _ci_idxs]
         busld_oe_ci_idxs = [(bus_id, oe, ci) for bus_id in busld_idxs for oe in _oe_idxs for ci in _ci_idxs]
-        #sets up all of the indexes for each bus, node and branch. 
+        #sets up all of the indexes for each bus, node and branch.
 
         # Calculate local active and reactive background load at each bus.
         # For participant NMIs, we don't include the active power forecast, as the active power will be
@@ -285,25 +285,25 @@ class SoeSolver:
         )
 
         # Operating envelope variables. These are power *injections*.
-        def oe_bounds(m, load_id, oe): 
-            #constrains how wide the bounds can be: can be between the minimum and 0 for import, and 0 and upper bound for export. 
+        def oe_bounds(m, load_id, oe):
+            #constrains how wide the bounds can be: can be between the minimum and 0 for import, and 0 and upper bound for export.
             return (-self.envelope_abs_max, 0.0) if oe == 'oel' else (0.0, self.envelope_abs_max)
-        # this is a variable for every combination of customer and scenario. this gives two variables per customer, one with the lower envelope bound and one the upper. 
-        #This just combines them 
+        # this is a variable for every combination of customer and scenario. this gives two variables per customer, one with the lower envelope bound and one the upper.
+        #This just combines them
         self.model.p_inj_oe_kw = Var(
             partic_oe_idxs, name="p_inj_oe_kw", domain=Reals,
             bounds=oe_bounds,
             initialize=0.0
         )
 
-        # Network support: also an optimization of customers bidding for network support. 
+        # Network support: also an optimization of customers bidding for network support.
         # two variables for each participant: how much more to consume (above what they're currently doing) and how much more to inject.both always >=0.
         self.model.network_support_kw = Var(
             partic_ci_idxs, name="network_support_kw", domain=NonNegativeReals, initialize=0.0
         )
 
         def init_sof_a(m, bus_id, oe, ci):
-            #initialisation variables for the soft slack variables. Pyomo lets you pass a function as initialise instead of a fixed number, so each customer can have a different guess. 
+            #initialisation variables for the soft slack variables. Pyomo lets you pass a function as initialise instead of a fixed number, so each customer can have a different guess.
             p = bus_ld_a_kw[bus_id]
             if p > 0 and ci == 'inj':
                 return p
@@ -323,11 +323,11 @@ class SoeSolver:
 
         self.model.sof_bus_a_kw = Var(busld_oe_ci_idxs, name="sof_bus_a_kw", domain=NonNegativeReals,
                                       initialize=init_sof_a)
-        #if a bus has positive background load, initialise the injuection slack. If not, initialise consumption slack. 
+        #if a bus has positive background load, initialise the injuection slack. If not, initialise consumption slack.
         self.model.sof_bus_r_kw = Var(busld_oe_ci_idxs, name="sof_bus_r_kw", domain=NonNegativeReals,
                                       initialize=init_sof_r)
         #same thing but for reactive power
-        
+
         # Allocation of loads in buses
 
         a_bus_pu = {(bus_id, oe): [] for bus_id in bus_idxs for oe in _oe_idxs}  # Active power
@@ -337,28 +337,28 @@ class SoeSolver:
             load_id = load_row.Index
             bus_id = load_row.bus_id
 
-            #reactive power: any load that has a forecast contributes it's reactive power forecast to the total (which is summed up later). 
-            #reactive power always treated as a fixed known quantity, no envelopes used. 
+            #reactive power: any load that has a forecast contributes it's reactive power forecast to the total (which is summed up later).
+            #reactive power always treated as a fixed known quantity, no envelopes used.
             if load_id in self.forecast_load_ids:
                 reactive_power = self.df_forecasts_filt.loc[load_id, "reactive_power_var"] * _w_to_pu
                 for oe in _oe_idxs:
                     r_bus_pu[bus_id, oe].append(reactive_power)
 
-            #if the node is a participant, their active power is the power injection (always negative). 
+            #if the node is a participant, their active power is the power injection (always negative).
             if load_id in self.offer_load_ids:
                 for oe in _oe_idxs:
                     a_bus_pu[(bus_id, oe)].append(-self.model.p_inj_oe_kw[load_id, oe] * _kw_to_pu)
 
-            #if they're not a participant, their active power is fixed as the forecast value. 
+            #if they're not a participant, their active power is fixed as the forecast value.
             elif load_id in self.forecast_load_ids:
                 active_power = self.df_forecasts_filt.loc[load_id, "real_power_w"] * _w_to_pu
                 for oe in _oe_idxs:
                     a_bus_pu[(bus_id, oe)].append(active_power)
 
         # Allocation of soft variables
-        #for each bus that has loads, and for each min and max envelope limit, it adds the net slack power at that bus. 
+        #for each bus that has loads, and for each min and max envelope limit, it adds the net slack power at that bus.
         #this accounts for if there is no combination of envelope settings that can satisfy all voltage and current limits simultaneously.
-        #avoids a no solution found error. 
+        #avoids a no solution found error.
         for bus_id in self.load_buses:
             for oe in _oe_idxs:
                 a_bus_pu[(bus_id, oe)].append(
@@ -388,7 +388,7 @@ class SoeSolver:
                 offer_inj_kw = self.df_offers_filt.loc[load_id, "injection"][0][0]
             else:
                 offer_inj_kw = 0.0
-            #constraint that you can't dispatch a customer more than they offered. 
+            #constraint that you can't dispatch a customer more than they offered.
             self.model.c.add(self.model.network_support_kw[load_id, 'con'] <= offer_con_kw)
             self.model.c.add(self.model.network_support_kw[load_id, 'inj'] <= offer_inj_kw)
             #customers pre-agreed envelope reservation, or what they are entitled to before any additional dispatch
@@ -409,7 +409,7 @@ class SoeSolver:
         # Power flow constraints
 
         # Voltage
-        # for each node, voltage has to be within limits. Infeeder has a fixed setpoint. Every other bus has to stay within the min and max values. 
+        # for each node, voltage has to be within limits. Infeeder has a fixed setpoint. Every other bus has to stay within the min and max values.
         for oe in _oe_idxs:
             for bus_row in self.buses.itertuples():
                 bus_id = bus_row.Index
@@ -425,7 +425,7 @@ class SoeSolver:
                         self.model.c.add(self.model.square_voltage_pu[bus_id, oe] >= bus_row.v_mag_min_pu**2)
 
         # Power flow
-        # power in = power out. 
+        # power in = power out.
         for oe in _oe_idxs:
             for branch_row in self.branches.itertuples():
                 branch_id = branch_row.Index
@@ -434,13 +434,13 @@ class SoeSolver:
 
                 # Line active is active injection into branch.
                 downstream_branch_ids = self.branches.loc[self.branches["from_bus_id"] == to_bus_id].index
-                # active power into a branch equals load at the destination plus resistive losses plus flows onto downstream branches. 
+                # active power into a branch equals load at the destination plus resistive losses plus flows onto downstream branches.
                 self.model.c.add(
                     self.model.branch_active_pu[branch_id, oe] == sum(a_bus_pu[to_bus_id, oe]) +
                     branch_row.r_pu * self.model.square_current_pu[branch_id, oe]
                     + sum(self.model.branch_active_pu[bid, oe] for bid in downstream_branch_ids)
                 )
-                #for resistive and inductive losses. 
+                #for resistive and inductive losses.
                 self.model.c.add(
                     self.model.branch_reactive_pu[branch_id, oe] == sum(r_bus_pu[to_bus_id, oe]) +
                     branch_row.x_pu * self.model.square_current_pu[branch_id, oe]
@@ -478,13 +478,13 @@ class SoeSolver:
                     self.model.branch_reactive_pu[branch_id, oe] * self.model.branch_reactive_pu[branch_id, oe]
                 )
 
-                #current in a cable can't exceed rated maximum. 
+                #current in a cable can't exceed rated maximum.
                 if pd.notna(branch_row.i_max_pu):
                     self.model.c.add(self.model.square_current_pu[branch_id, oe] <= branch_row.i_max_pu**2)
-        # everything is squared here, because working with V^2 and I^2 keeps the constraints in a form that avoids square roots. 
+        # everything is squared here, because working with V^2 and I^2 keeps the constraints in a form that avoids square roots.
         # Objective function -----------------------------------------------------------------------------------------
-        #minimises the sum of three terms, with each representing a different priority. 
-        #firstly, for every participant being dispatched, calculate the cost for the dispatch quantity. Summed separately for consumption and injection dispatches, then added together. 
+        #minimises the sum of three terms, with each representing a different priority.
+        #firstly, for every participant being dispatched, calculate the cost for the dispatch quantity. Summed separately for consumption and injection dispatches, then added together.
         first_term = sum(
             self.model.network_support_kw[load_id, 'con'] *
             self.df_offers_filt.loc[load_id, "consumption"][0][1] * (5/60.0) for load_id in self.offer_load_ids if
@@ -497,13 +497,13 @@ class SoeSolver:
 
         big_weight = 1000.0  # Dollars per kWh
         small_weight = 0.001  # Dollars per kWh
-        #second term is the envelope width penalty, a small cost for smaller envelopes so tend towards wider envelopes. 
+        #second term is the envelope width penalty, a small cost for smaller envelopes so tend towards wider envelopes.
         second_term = small_weight * sum(
             self.model.p_inj_oe_kw[load_id, 'oel'] - self.model.p_inj_oe_kw[load_id, 'oer']
             for load_id in self.offer_load_ids
         )
 
-        #Third term is penalty for violation, $1000/kWh, only a last resort option. 
+        #Third term is penalty for violation, $1000/kWh, only a last resort option.
         third_term = big_weight * (
             sum(
                 self.model.sof_bus_a_kw[bus_id, oe, ci] + self.model.sof_bus_r_kw[bus_id, oe, ci]
@@ -512,7 +512,7 @@ class SoeSolver:
         )
 
         self.model.value = Objective(expr=first_term + second_term + third_term, sense=minimize)
-    #this is the IPOPT solver instance, calling the solver. 
+    #this is the IPOPT solver instance, calling the solver.
     def _solve_opt_model(self):
         solver = SolverFactory("ipopt")
         for k, v in self.solver_options.items():
@@ -522,7 +522,7 @@ class SoeSolver:
             results = solver.solve(self.model, tee=True)  # tee=True to see solver output
 
         return results['Solver'][0].status
-    #reads solved variables back out into df. 
+    #reads solved variables back out into df.
     def _extract_results(self):
         # Network
         recs = []
@@ -622,7 +622,7 @@ class SoeSolver:
         results_soe = pd.DataFrame.from_records(recs).set_index("load_id").round(6) if len(recs) > 0 else pd.DataFrame()
 
         return namedtuple("Results", "bus branch viol soe")(results_bus, results_branch, results_viol, results_soe)
-    # this is called at the start of the model, which pre-computes background load at each bus before the optimization model is built. 
+    # this is called at the start of the model, which pre-computes background load at each bus before the optimization model is built.
     def _calculate_bus_loads_kw(self, bus_idxs):
         '''
         Calculate local active and reactive background load at each bus.
@@ -650,7 +650,7 @@ def solve_soes(netw_ejson, df_forecasts_t, df_offers_t, solver_options={}):
     status, results = solver.solve()
     return solver, status, results
 
-#parses the JSON structure and gets the network dictionary. 
+#parses the JSON structure and gets the network dictionary.
 def _netw_components(netw_ejson, comp_type=None):
     comps = ((k1, k2, v2) for k1, v1 in netw_ejson["components"].items() for k2, v2 in v1.items())
     if comp_type is None:

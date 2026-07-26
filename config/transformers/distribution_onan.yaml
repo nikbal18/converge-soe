@@ -1,0 +1,23 @@
+# Distribution transformer, ONAN cooling — IEEE C57.91 thermal parameters.
+# Converted from examples/scenario_doe/transformer_params.json by
+# scripts/organise_repo.py. One file per transformer class; select via
+# config/default.yaml -> thermal.transformer_class.
+#
+# Sources: IEEE Std C57.91-2011 Annex G typical values for small ONAN
+# distribution transformers; matched to the values used in the honours
+# project to date. Review against the actual EvoEnergy fleet data sheets.
+
+tau_TO: 60.0                # min — top-oil thermal time constant
+tau_W: 7.0                  # min — winding (hot-spot) thermal time constant
+delta_theta_TO_R: 55.0      # °C — top-oil rise over ambient at rated load
+delta_theta_HS_R: 23.0      # °C — hot-spot rise over top-oil at rated load
+R: 6.0                     # — ratio of rated load loss to no-load loss
+n: 0.8                     # — top-oil exponent (0.8 ONAN, 0.9 ONAF, 1.0 OFAF)
+m: 0.8                     # — winding exponent  (0.8 ONAN, 0.9-1.0 forced)
+I_rated: 50.0              # A — rated secondary current; the pipeline normally
+                            #     overrides this per substation from s_max/v_secondary
+theta_HS_max: 120.0         # °C — hot-spot temperature limit (110 normal life,
+                            #     120 planned loading beyond nameplate — C57.91 Table 8)
+dt: 30.0                    # min — timestep; MUST equal the timeseries interval.
+                            #     The pipeline overrides this from the data and
+                            #     preflight PHY005 errors on a mismatch.

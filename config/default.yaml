@@ -1,0 +1,104 @@
+# =============================================================================
+# converge-soe pipeline defaults.
+#
+# Precedence: CLI flags  >  config/feeders/<FEEDER>.yaml  >  this file.
+# The fully resolved configuration for every run is written to
+# out/<FEEDER>/<RUN_ID>/config_resolved.yaml, so a run is always reproducible.
+# =============================================================================
+
+# --- Scenarios ---------------------------------------------------------------
+scenarios: [doe_dtr, doe_static, bau]   # which of the three to run
+
+# --- Envelopes ---------------------------------------------------------------
+envelope_abs_max: 50.0        # kW — hard cap on envelope half-width per NMI.
+                              # Must exceed every participant's peak forecast
+                              # magnitude (preflight MDL002), or the envelope is
+                              # clipped by this parameter instead of the network.
+
+# --- Transformer limit / thermal model ---------------------------------------
+thermal:
+  transformer_class: distribution_onan   # file in config/transformers/
+  k_emergency: 2.0            # — hard mechanical/short-time backstop on the DTR
+                              # limit, as a multiple of rated current. Bushings,
+                              # tap changers and LV cabling do not get more
+                              # capable when the oil is cold. K²_max is bracketed
+                              # on [0, k_emergency²].
+  k2_floor: 1.0e-6            # — floor on K²_max when the transformer is already
+                              # over its hot-spot limit from stored heat
+                              # ("already_over_limit"): keeps the problem feasible
+                              # and visible instead of fatal.
+  derive_i_rated: true        # derive I_rated per substation from s_max /
+                              # v_secondary (recommended); false = use the value
+                              # in the transformer class file for every substation.
+
+tx_limit: dtr                 # dtr | static | legacy — transformer current limit
+                              # mode for DOE scenarios (scenario definitions
+                              # override this per scenario; the flag exists for
+                              # single-scenario debugging).
+
+# --- Solver ------------------------------------------------------------------
+solver:
+  name: ipopt                 # AMPL-interface executable Pyomo can find. On the
+                              # laptop ipopt is installed via conda — run from a
+                              # conda-activated shell (docs/TROUBLESHOOTING.md).
+  linear_solver: mumps        # mumps (open source) or ma27 (HSL, faster)
+  fast: false                 # true = persistent mutable-Param model (--fast);
+                              # validated against the plain path by
+                              # tests/test_fast_path_equivalence.py
+  soft_limits: true           # add penalised slacks on voltage and current
+                              # limits so "infeasible" becomes a quantified
+                              # violation in viol.parquet instead of a missing row
+  soft_limit_penalty: 1000.0  # $/kWh-equivalent objective penalty on those slacks
+  options:                    # extra ipopt options passed straight through.
+                              # These two cut iteration counts ~40% on the
+                              # 150-NMI benchmark (docs/profile_after.txt);
+                              # delete them to run at ipopt defaults.
+    mu_strategy: adaptive
+    tol: 1.0e-6
+  usable_export_weight: 0.01  # small objective reward on min(doe_ub, desired
+                              # export) per NMI: allocates envelope headroom to
+                              # customers who can actually use it. Without it
+                              # the per-NMI split of surplus capacity is
+                              # mathematically degenerate and curtailment
+                              # metrics become arbitrary. 0 = legacy behaviour.
+
+# --- Execution ---------------------------------------------------------------
+jobs: auto                    # parallel substations; auto = cpu_count - 1
+flush_every: 200              # timesteps between parquet row-group flushes /
+                              # checkpoints; smaller = less lost on crash,
+                              # bigger = slightly faster
+resume: true                  # continue from checkpoint when inputs fingerprint
+                              # matches; a mismatch refuses and requires --restart
+csv_mirror: false             # additionally write CSV next to every parquet
+
+# --- Timeseries --------------------------------------------------------------
+timeseries:
+  values_are: null            # w | kw | kwh_per_interval — REQUIRED for wide
+                              # meter exports (no silent unit guessing). Long
+                              # format with real_power_w columns is taken as W.
+  reactive_from_q: true       # use summed Q* channels when present; else
+                              # reactive = pf_ratio × active
+  pf_ratio: 0.4               # reactive/active ratio fallback
+  fill_missing_with_zero: true  # gaps become 0 W and are flagged in the mask
+  min_coverage: 0.90          # preflight TS004 warns below this per-NMI coverage
+
+# --- Ambient temperature ------------------------------------------------------
+ambient:
+  source: cache               # cache | constant | open_meteo
+  constant_c: 25.0            # used when source: constant
+  site_lat: -35.2035          # central Canberra (Open-Meteo fetch)
+  site_lon: 149.1548
+  cache_dir: data/ambient
+
+# --- Economics ---------------------------------------------------------------
+curtailment_price_per_kwh: 0.10   # $ — flat price used to value curtailed
+                                  # export (representative feed-in tariff).
+                                  # AN ASSUMPTION, NOT A RESULT: it is printed
+                                  # on every plot and table that uses it.
+price_series_csv: null            # optional CSV (timestamp, price_per_kwh);
+                                  # if set, each interval is valued at its own
+                                  # price instead of the flat number above.
+
+# --- Preflight ---------------------------------------------------------------
+preflight:
+  strict: true                # abort the run on any preflight ERROR
