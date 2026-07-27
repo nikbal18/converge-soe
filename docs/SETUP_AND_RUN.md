@@ -83,9 +83,25 @@ applies LV voltage limits of +/-10% by default.
 
 ```
 python network_conversion/cim_to_network_json.py \
-  "data/feeder.xml" \
-  "data/substation_A_LVNetwork.xml" \
-  "data/substation_B_LVNetwork.xml" \
+  "data/Lexcen_202604081113.xml" \
+  "data/S 5402_LVNetwork_202604081113.xml" \
+  "data/S 5406_LVNetwork_202604081113.xml" \
+  "data/S 5408_LVNetwork_202604081114.xml" \
+  "data/S 5409_LVNetwork_202604081114.xml" \
+  "data/S 5549_LVNetwork_202604081113.xml" \
+  "data/S 5550_LVNetwork_202604081114.xml" \
+  "data/S 5846_LVNetwork_202604081113.xml" \
+  "data/S 6158_LVNetwork_202604081114.xml" \
+  "data/S 6918_LVNetwork_202604081114.xml" \
+  "data/S 6921_LVNetwork_202604081114.xml" \
+  "data/S 8029_LVNetwork_202604081114.xml" \
+  "data/S 8082_LVNetwork_202604081114.xml" \
+  "data/S 8199_LVNetwork_202604081114.xml" \
+  "data/S 8391_LVNetwork_202604081114.xml" \
+  "data/S 8511_LVNetwork_202604081114.xml" \
+  "data/S 8673_LVNetwork_202604081114.xml" \
+  "data/S 8701_LVNetwork_202604081114.xml" \
+  "data/S 8712_LVNetwork_202604081114.xml" \
   -o data/feeder_network.json
 ```
 
@@ -112,11 +128,12 @@ your export.
 
 ```
 python examples/scenario_2/data_translation/wide_to_long_translator.py \
-  -i data/meter_export.csv \
+  -i data/lexcen_year_data.csv \
   -o data/forecast_timeseries.csv \
-  --day 15/01/2024 \
   --reactive-from-q
 ```
+
+  --day 01/06/2023 \
 
 - `--day DD/MM/YYYY` — the summer day to study (omit to use all days in the file).
 - `--values-are-kw` — only if your meter values are already average kW rather
@@ -136,10 +153,9 @@ python examples/run_doe_feeder.py \
   data/forecast_timeseries.csv \
   out/summer_day \
   --transformer-params examples/scenario_doe/transformer_params.json \
-  --only "SUBSTATION_A,SUBSTATION_B" \
   --open-meteo
 ```
-
+  --only "SUBSTATION_A,SUBSTATION_B" \
 - `--only "..."` — comma list of substation id/name substrings; omit to run every
   substation on the feeder.
 - `--transformer-params ...` — IEEE C57.91 thermal parameters; omit for a plain

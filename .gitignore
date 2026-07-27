@@ -4,6 +4,7 @@ __pycache__/
 *.egg-info/
 .egg-info/
 .venv/
+test_conversion/
 
 # ---------------------------------------------------------------------------
 # CONFIDENTIAL — never commit to this public repo
@@ -16,11 +17,16 @@ __pycache__/
 
 # Converted network models built from real exports (topology + placed NMIs)
 *_network.json
+*_network*.json
 *_lv_network.json
 GOLDCR_*.json
 LEXCEN_*.json
 S5402*.json
+S_*_AT*.json
+S_*_lv*.json
 network_conversion/*.json
+*.parquet
+*.npz
 
 # Real interval-meter / NMI data and anything derived from it
 examples/scenario_2/

@@ -466,8 +466,19 @@ def build_network(data, args):
         ends = data["tx_ends"][eid]
         u1 = ends[min(ends)]["rated_u"]
         u2 = ends[max(ends)]["rated_u"]
-        node_v[n0] = node_v.get(n0) or u1
-        node_v[n1] = node_v.get(n1) or u2
+
+        hv_u = max(u1, u2)
+        lv_u = min(u1, u2)
+
+        if (node_v.get(n0) or 0) > (node_v.get(n1) or 0):
+            node_v[n0] = hv_u
+            node_v[n1] = lv_u
+        elif (node_v.get(n1) or 0) > (node_v.get(n0) or 0):
+            node_v[n1] = hv_u
+            node_v[n0] = lv_u
+        else:
+            node_v[n0] = hv_u
+            node_v[n1] = lv_u
 
     # ---- coordinates -------------------------------------------------------
     node_xy = {}
@@ -513,6 +524,9 @@ def build_network(data, args):
 
     for n in sorted(used_nodes):
         v = node_v.get(n) or mv_v
+        if v < 1000.0:
+            v = 400.0
+        
         nd = {
             "phs": PH,
             "v_base": round(v / 1000.0, 6),
@@ -621,7 +635,7 @@ def build_network(data, args):
                 "tap_side": "primary",
                 "taps": [tap],
                 "v_winding_base": [u1 / 1000.0, u2 / 1000.0],
-                "vector_group": "yy0",  # solver requires vg[0]==vg[1]
+                "vector_group": ["yy0","yy0"],  # solver requires vg[0]==vg[1]
                 "z": [[0.0, 0.0], z_sec],
                 "user_data": {
                     "name": (sub + " " + (data["transformers"][eid]["name"] or "")).strip(),
