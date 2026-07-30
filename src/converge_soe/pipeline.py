@@ -91,7 +91,7 @@ def update_manifest(repo, key, fingerprint):
     m = read_manifest(repo)
     m[key] = {"fingerprint": fingerprint, "updated": datetime.now().isoformat()}
     tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(m, indent=1))
+    tmp.write_text(json.dumps(m, indent=1), encoding="utf-8")
     os.replace(tmp, p)
 
 
@@ -169,6 +169,132 @@ def stage_prepare_timeseries(repo=REPO, cfg=None, meter_files=None,
     update_manifest(repo, "timeseries", fp)
     log(f"stage ② prepare timeseries: {df['load_id'].nunique()} NMIs × "
         f"{df['timestamp'].nunique()} timesteps -> {out}")
+    return df
+
+
+def apply_network_overrides(feeder_ej, cfg, log=logger.info):
+    """Correct fabricated / questionable values in the converted network.
+
+    Two inputs on the Gold Creek export are not real measurements:
+
+    * **Taps.** The LVNetwork XML contains no ``neutralTap``, ``normalTap``,
+      ``numberOfTaps`` or ``tapPercent`` elements at all, so ``cim_to_json``
+      falls back to ``int(... or 1)`` and a 1.25% default step. The result is
+      visibly synthetic — taps scattered over {0,1,2,3,4,-1} with two different
+      step sizes on one feeder. ``fixed_lv_taps`` pins them to nominal, which
+      is also the honest model for an 11 kV/415 V distribution transformer:
+      its taps are off-load and nobody changes them.
+
+    * **Source voltage.** ``infeeder_v_setpoint_kv`` overrides the feeder-head
+      setpoint. The default of 11.55 kV is 1.05 pu, and because the turns ratio
+      maps 11 kV to 415 V on a 400 V node base (a real +3.75% boost, deliberate
+      so the far end sits near 400 V after volt drop), the LV terminals start
+      at 1.089 pu unloaded — leaving almost no headroom to the 1.10 limit
+      before any customer does anything.
+
+    Both are recorded in config_resolved.yaml.
+    """
+    ncfg = (cfg or {}).get("network", {}) or {}
+    changed = False
+
+    if ncfg.get("fixed_lv_taps"):
+        n, was = 0, []
+        for cid, comp in feeder_ej["components"].items():
+            t = comp.get("Transformer")
+            if not t or not t.get("taps"):
+                continue
+            if any(x != 0 for x in t["taps"]):
+                was.append(t["taps"][0])
+                n += 1
+            t["taps"] = [0] * len(t["taps"])
+        if n:
+            log(f"network override: pinned {n} transformer(s) to nominal tap "
+                f"(were {sorted(set(was))}) — the XML carries no tap data, so "
+                f"the converted values were cim_to_json defaults")
+            changed = True
+
+    derate = ncfg.get("transformer_derate")
+    if derate is not None and float(derate) != 1.0:
+        derate = float(derate)
+        n = 0
+        for cid, comp in feeder_ej["components"].items():
+            t = comp.get("Transformer")
+            if not t or "s_max" not in t:
+                continue
+            t["s_max"] = t["s_max"] * derate
+            ud = t.setdefault("user_data", {})
+            ud["s_rated"] = t["s_max"]
+            ud["derated_by"] = derate
+            n += 1
+        if n:
+            log(f"network override: derated {n} transformer(s) to "
+                f"{100*derate:.0f}% of nameplate — makes the TRANSFORMER the "
+                f"binding constraint instead of LV voltage rise, without "
+                f"changing load or voltage")
+
+    sp = ncfg.get("infeeder_v_setpoint_kv")
+    if sp is not None:
+        for cid, comp in feeder_ej["components"].items():
+            inf = comp.get("Infeeder")
+            if inf is None:
+                continue
+            old = inf.get("v_setpoint")
+            inf["v_setpoint"] = float(sp)
+            log(f"network override: infeeder {cid} v_setpoint "
+                f"{old} -> {float(sp)} kV")
+            changed = True
+
+    if changed:
+        log("  (network overrides are assumptions, not measurements — they are "
+            "recorded in config_resolved.yaml)")
+    return feeder_ej
+
+
+def stage_scale_load(df_long, cfg, log=logger.info):
+    """Stress test: multiply demand and/or PV export by a constant.
+
+    Applied to the normalised long table immediately after stage ②, so
+    everything downstream sees the same scaled world — preflight screens, the
+    synthetic-profile donor pool, and the bundles. Because the bundles change,
+    their fingerprint changes too, so --resume cannot hand back unscaled
+    results from an earlier run.
+
+    Import (P >= 0) and export (P < 0) scale independently: a feeder can be
+    thermally constrained at winter peak and voltage-constrained at midday
+    export, and those are different questions. Reactive power follows the same
+    factor as its own row, so power factor is preserved.
+
+    This makes a run COUNTERFACTUAL — it is a what-if, not a measurement.
+    """
+    sc = cfg.get("scaling", {}) or {}
+    imp = float(sc.get("import", 1.0))
+    exp = float(sc.get("export", 1.0))
+    if imp == 1.0 and exp == 1.0:
+        return df_long
+    if imp < 0 or exp < 0:
+        raise ValueError("scaling factors must be non-negative")
+
+    df = df_long.copy()
+    p = df["real_power_w"].to_numpy(dtype=float)
+    factor = np.where(p >= 0.0, imp, exp)
+    df["real_power_w"] = p * factor
+    if "reactive_power_var" in df.columns:
+        df["reactive_power_var"] = (
+            df["reactive_power_var"].to_numpy(dtype=float) * factor)
+
+    peak_kw = df["real_power_w"].max() / 1000.0
+    trough_kw = df["real_power_w"].min() / 1000.0
+    log(f"stage ②b scale load: import ×{imp:g}, export ×{exp:g} — "
+        f"per-NMI peak now {peak_kw:.1f} kW, peak export {trough_kw:.1f} kW "
+        f"(COUNTERFACTUAL run)")
+
+    cap = float(cfg.get("envelope_abs_max", 50.0))
+    worst = max(abs(peak_kw), abs(trough_kw))
+    if worst > cap:
+        log(f"  ! scaled demand exceeds envelope_abs_max ({cap:g} kW): the "
+            f"envelope is clipped by that parameter rather than by the "
+            f"network, so the DOEs will not mean what you want. Raise it with "
+            f"--envelope-abs-max (>= {worst:.0f}).")
     return df
 
 
@@ -329,8 +455,91 @@ def stage_preindex(substations, nmi_index, df_long, ambient, repo=REPO,
 
 
 # ---------------------------------------------------------------------------
+# Stage ⑤b — synthesise profiles for NMIs with no meter data
+# ---------------------------------------------------------------------------
+def stage_synthesise(substations, bundles, cfg, run_dir=None, repo=REPO,
+                     feeder_name="FEEDER", log=logger.info):
+    """Fill in Loads that have no interval-meter data.
+
+    Stage ③ only indexes NMIs that matched the meter export, so Loads without
+    data are not columns in the bundle at all and contribute nothing to the
+    power flow. This stage adds them (see synthetic.py) and rewrites each
+    ``.npz``, because stage ⑥ reloads bundles from disk in worker processes and
+    fingerprints them for resume.
+
+    Returns (bundles, reports).
+    """
+    from . import synthetic as syn
+
+    # Substations with no metered NMIs get no bundle from stage ⑤ and are left
+    # alone here too: on a partial feeder export they are substations whose LV
+    # network was deliberately not supplied, not substations whose customers
+    # are missing. Synthesising them would invent a whole substation. Logged so
+    # the omission is visible rather than silent.
+    bundles = dict(bundles)
+    skipped = [safe for safe, sub_ej in substations.items()
+               if safe not in bundles and syn.network_loads(sub_ej)]
+    if skipped:
+        log(f"stage ⑤b synthesise: {len(skipped)} substation(s) have no metered "
+            f"NMIs and are skipped entirely: {', '.join(sorted(skipped))}")
+
+    bundles, reports = syn.synthesise_all(substations, bundles, cfg, log=log)
+
+    for safe, bundle in bundles.items():
+        if not np.asarray(bundle.get("synthetic", False)).any():
+            continue
+        out = (Path(repo) / "build" / "timeseries" / "by_substation"
+               / feeder_name / f"{safe}.npz")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(out, **bundle)
+        log(f"stage ⑤b synthesise: {safe}: bundle rewritten -> {out.name} "
+            f"({bundle['P'].shape[0]} steps × {bundle['P'].shape[1]} NMIs)")
+
+    if run_dir and reports:
+        p = Path(run_dir) / "synthetic_report.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(reports, indent=2, default=str), encoding="utf-8")
+        log(f"stage ⑤b synthesise: report -> {p.name}")
+
+    return bundles, reports
+
+
+# ---------------------------------------------------------------------------
 # Stage ⑥ — solve
 # ---------------------------------------------------------------------------
+class _PyomoWarningCounter(logging.Filter):
+    """Swallow Pyomo's per-variable warnings, keep a tally.
+
+    Pyomo emits one W1002 per variable per timestep when a warm-started value
+    sits outside its bounds, which floods the console with thousands of lines
+    that say nothing actionable. They are counted here and reported once, and
+    still written in full to the per-run log file. -vvv lets them through.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.counts = {}
+
+    def filter(self, record):
+        msg = record.getMessage()
+        code = next((c for c in ("W1002", "W1001", "W1003")
+                     if c in msg), None)
+        if code is None:
+            return True
+        self.counts[code] = self.counts.get(code, 0) + 1
+        return False
+
+
+def _quiet_pyomo(verbosity):
+    """Attach the counter to Pyomo's loggers. Returns it (or None)."""
+    if verbosity >= 3:
+        return None
+    counter = _PyomoWarningCounter()
+    for name in ("pyomo", "pyomo.core", "pyomo.common.numeric_types"):
+        logging.getLogger(name).addFilter(counter)
+    return counter
+
+
 def _solve_one(args):
     """Worker: one (scenario, substation). Runs in its own process."""
     (scenario, safe, sub_ej, bundle_path, tparams, cfg, outdir, fingerprint,
@@ -340,6 +549,9 @@ def _solve_one(args):
     import tempfile
     from pyomo.common.tempfiles import TempfileManager
     TempfileManager.tempdir = tempfile.gettempdir()
+
+    # Runs in its own process, so the filter has to be installed here.
+    _pyomo_warnings = _quiet_pyomo(verbosity)
 
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -377,7 +589,9 @@ def _solve_one(args):
         dt = time.perf_counter() - t0
         return {"scenario": scenario, "substation": safe, "status": "ok",
                 "n_completed": writer.n_completed,
-                "n_failed": writer.n_failed, "seconds": round(dt, 1)}
+                "n_failed": writer.n_failed, "seconds": round(dt, 1),
+                "pyomo_warnings": dict(_pyomo_warnings.counts)
+                if _pyomo_warnings else {}}
     except cio.StaleResumeError as e:
         return {"scenario": scenario, "substation": safe,
                 "status": "stale_checkpoint", "error": str(e)}
@@ -441,6 +655,17 @@ def stage_solve(substations, bundles, tparams_by_sub, cfg, run_dir,
                 _report_result(r, run_dir, bar, verbosity, log)
     if bar is not None:
         bar.close()
+
+    # One line instead of thousands. Full text is still in each run.log.
+    tally = {}
+    for r in results:
+        for code, n in (r.get("pyomo_warnings") or {}).items():
+            tally[code] = tally.get(code, 0) + n
+    if tally and verbosity >= 1:
+        detail = ", ".join(f"{n:,}× {code}" for code, n in sorted(tally.items()))
+        log(f"  pyomo: {detail} suppressed (harmless bound/initialisation "
+            f"notices; -vvv to show them, full text in each run.log)")
+
     return results
 
 
@@ -473,7 +698,7 @@ def make_run_dir(repo, feeder_name, run_id=None):
 
 def write_resolved_config(run_dir, cfg):
     (Path(run_dir) / "config_resolved.yaml").write_text(
-        yaml.safe_dump(cfg, sort_keys=False))
+        yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
 
 
 def derive_tparams(sub_ej, base_params, cfg, dt_minutes):

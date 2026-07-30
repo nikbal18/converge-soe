@@ -36,6 +36,98 @@ tx_limit: dtr                 # dtr | static | legacy — transformer current li
                               # override this per scenario; the flag exists for
                               # single-scenario debugging).
 
+# --- Network corrections ------------------------------------------------------
+# The DMS LVNetwork export carries no tap data at all, so cim_to_json used to
+# invent tap positions from defaults — on Gold Creek that shifted LV voltages
+# by up to +7.5% and put 99.7% of nodes over the 1.10 pu limit before any load.
+# Distribution transformer taps are off-load and never moved, so nominal is
+# both the honest and the useful model. cim_to_json now emits nominal when the
+# export has no RatioTapChanger; this override does the same for networks that
+# were built before that change, so old build/ artefacts stay correct.
+network:
+  fixed_lv_taps: true
+  infeeder_v_setpoint_kv: null   # null = use the converted value (11.55 kV =
+                                 # 1.05 pu). The turns ratio maps 11 kV to
+                                 # 415 V on a 400 V node base — a real +3.75%
+                                 # boost so the far end sits near 400 V after
+                                 # volt drop — so 11.55 leaves the LV terminals
+                                 # at 1.089 pu unloaded, with ~1% headroom.
+                                 # Set 11.0 for 1.0375 pu and ~6% headroom.
+
+# --- Load scaling (stress test) ----------------------------------------------
+# Multiply every NMI's demand and/or PV export by a constant, applied to the
+# normalised timeseries right after stage ②. Use it to push a lightly-loaded
+# feeder into its thermal and voltage limits and see whether the DOEs actually
+# bind — on unscaled data the envelopes are often slack, so DTR vs static looks
+# identical and tells you nothing.
+#
+# Import and export scale independently: thermal limits bite at winter peak,
+# voltage limits at midday export, and they are different questions.
+#
+# ANY value other than 1.0 makes the run COUNTERFACTUAL — a what-if, not a
+# measurement. It is recorded in config_resolved.yaml so a run is never
+# ambiguous. CLI: --scale-load 2 (both), or --scale-import / --scale-export.
+scaling:
+  import: 1.0                 # multiplies consumption (P >= 0)
+  export: 1.0                 # multiplies PV export (P < 0)
+
+# --- Synthetic profiles for NMIs without meter data --------------------------
+# The meter export only covers NMIs that have measurements. Those without data
+# are not columns in the pre-indexed bundle at all, so they contribute NOTHING
+# to the power flow: the feeder looks unloaded and the envelopes come out too
+# generous. Stage ⑤b fills them in. They load the network but never receive an
+# envelope (no meter, no DOE). Run with --no-synthetic to reproduce the old
+# behaviour and quantify the difference.
+synthetic:
+  enabled: true
+  participants: false         # false (default, physical): synthetic NMIs have
+                              # no meter, so they get no envelope and act as
+                              # uncontrollable background load.
+                              # true (diagnostic): treat them as dispatchable
+                              # too. Not realistic — you cannot send a DOE to a
+                              # customer you cannot measure — but it gives the
+                              # UPPER BOUND on what DOEs could do for the
+                              # transformer if every customer participated.
+                              # The gap between the two runs is the cost of the
+                              # missing metering. CLI: --synthetic-participate
+  min_donors: 5               # below this many usable donors, sampling is
+                              # meaningless and the transformer-disaggregation
+                              # fallback is used. Counted against the
+                              # FEEDER-WIDE pool (see allow_feeder_donors), so
+                              # it guards against a feeder with almost no
+                              # metered NMIs at all rather than a thin
+                              # substation — it should effectively never fire.
+  match_pv: true              # match donor rooftop PV to the target's
+                              # user_data.der where the network has it
+  without_replacement: true   # preserves the observed distribution rather than
+                              # over-weighting repeat picks
+  include_placeholder_loads: false   # cim_to_json LV dead-end stubs are
+                                     # topology, not customers
+  allow_feeder_donors: true   # draw from every metered NMI on the feeder, not
+                              # just this substation. Consumption does not vary
+                              # much geographically within a feeder, so a donor
+                              # two substations away is as representative as one
+                              # next door — and the larger pool avoids reusing
+                              # the same profile many times, which would
+                              # understate coincidence diversity. On Gold Creek
+                              # this takes the pool from 49 to 376 for 72 gaps.
+  max_donor_share: 0.20       # warn if one donor covers more than this share
+                              # of a substation's synthetic load
+  on_missing: error           # error | warn_zero — what to do when a thin
+                              # substation has no transformer series to fall
+                              # back on. warn_zero fills with zeros, which is
+                              # only ever a deliberate baseline.
+  seed: 42                    # re-run across seeds and compare the DOEs; the
+                              # spread is the sensitivity to this assumption
+  power_factor: 0.95          # for the fallback only (NEM12 is active-only)
+  size_diversity: 0.6         # fallback: log-normal sigma on customer size
+  temporal_diversity: 0.15    # fallback: deviation from the aggregate shape
+  transformer_series: {}      # substation -> csv path (or {path:, column:})
+                              # for the fallback. Must be an INDEPENDENT
+                              # measurement: a meter-derived ESTIMATION column
+                              # is a gross-up of the very meters being
+                              # subtracted, and is therefore circular.
+
 # --- Solver ------------------------------------------------------------------
 solver:
   name: ipopt                 # AMPL-interface executable Pyomo can find. On the
@@ -45,6 +137,18 @@ solver:
   fast: false                 # true = persistent mutable-Param model (--fast);
                               # validated against the plain path by
                               # tests/test_fast_path_equivalence.py
+  max_cpu_time: 120           # s — wall-clock cap per solve. Without one, a
+                              # single pathological interval ran 5189 s and
+                              # held the whole run hostage. Losing that
+                              # interval costs one row; losing the afternoon
+                              # costs the run.
+  retry_on_failure: true      # on a failed solve, retry that interval once
+                              # with an adaptive barrier and relaxed bounds.
+                              # Most failures are "Error in step computation"
+                              # — the KKT factorisation giving up on a
+                              # marginally-conditioned model, not genuine
+                              # infeasibility — and the retry recovers many of
+                              # them. Only failed intervals pay the cost.
   soft_limits: true           # add penalised slacks on voltage and current
                               # limits so "infeasible" becomes a quantified
                               # violation in viol.parquet instead of a missing row

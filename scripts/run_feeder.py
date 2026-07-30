@@ -52,6 +52,30 @@ def parse_args():
                          "(single-scenario debugging)")
     ap.add_argument("--values-are", default=None,
                     choices=["w", "kw", "kwh_per_interval"])
+    ap.add_argument("--fixed-lv-taps", action="store_true",
+                    help="pin every LV transformer to nominal tap. The XML "
+                         "carries no tap data, so the converted values are "
+                         "cim_to_json defaults, not measurements")
+    ap.add_argument("--transformer-derate", type=float, default=None,
+                    help="scale every transformer's s_max (e.g. 0.5 = half "
+                         "nameplate). Makes the transformer the binding "
+                         "constraint instead of LV voltage rise, without "
+                         "changing load or voltage. Counterfactual.")
+    ap.add_argument("--infeeder-kv", type=float, default=None,
+                    help="override the feeder-head voltage setpoint in kV "
+                         "(default 11.55 = 1.05 pu, which leaves the LV "
+                         "terminals at ~1.089 pu unloaded)")
+    ap.add_argument("--scale-load", type=float, default=None,
+                    help="stress test: multiply ALL NMI demand and PV export "
+                         "by this factor (e.g. 2 or 3) to push the network "
+                         "into its limits and see whether the DOEs bind. "
+                         "Makes the run counterfactual.")
+    ap.add_argument("--scale-import", type=float, default=None,
+                    help="scale only consumption (P >= 0); overrides "
+                         "--scale-load for import")
+    ap.add_argument("--scale-export", type=float, default=None,
+                    help="scale only PV export (P < 0); overrides "
+                         "--scale-load for export")
     ap.add_argument("--theta-a", type=float, default=None,
                     help="constant ambient °C (sets ambient.source=constant)")
     ap.add_argument("--envelope-abs-max", type=float, default=None)
@@ -70,6 +94,15 @@ def parse_args():
     ap.add_argument("--skip-timeseries", action="store_true")
     ap.add_argument("--skip-preflight", action="store_true")
     ap.add_argument("--skip-preindex", action="store_true")
+    ap.add_argument("--synthetic-participate", action="store_true",
+                    help="give the synthetic (unmetered) NMIs envelopes too. "
+                         "Not physical — no meter means no DOE — but it shows "
+                         "the upper bound on what DOEs could do for the "
+                         "transformer if every customer were dispatchable")
+    ap.add_argument("--no-synthetic", action="store_true",
+                    help="do not synthesise profiles for NMIs without meter "
+                         "data; they contribute nothing to the power flow "
+                         "(the old behaviour — use to quantify the difference)")
     ap.add_argument("--skip-solve", action="store_true")
     ap.add_argument("--skip-analyse", action="store_true")
     ap.add_argument("--list-feeders", action="store_true")
@@ -110,6 +143,21 @@ def main():
         overrides["ambient"] = {"source": "constant", "constant_c": args.theta_a}
     if args.tx_limit:
         overrides["tx_limit"] = args.tx_limit
+    if args.fixed_lv_taps:
+        overrides.setdefault("network", {})["fixed_lv_taps"] = True
+    if args.infeeder_kv is not None:
+        overrides.setdefault("network", {})["infeeder_v_setpoint_kv"] = args.infeeder_kv
+    if args.transformer_derate is not None:
+        overrides.setdefault("network", {})["transformer_derate"] = args.transformer_derate
+    if args.synthetic_participate:
+        overrides.setdefault("synthetic", {})["participants"] = True
+    if any(v is not None for v in (args.scale_load, args.scale_import,
+                                   args.scale_export)):
+        base = args.scale_load if args.scale_load is not None else 1.0
+        overrides["scaling"] = {
+            "import": args.scale_import if args.scale_import is not None else base,
+            "export": args.scale_export if args.scale_export is not None else base,
+        }
 
     cfg = pl.load_config(REPO, feeder=args.feeder, overrides=overrides)
     scenarios = cfg.get("scenarios", ["doe_dtr", "doe_static", "bau"])
@@ -138,10 +186,16 @@ def main():
             sys.exit(f"{feeder_path} not found — run the build stage or pass "
                      "--feeder-json")
     feeder_ej = json.loads(feeder_path.read_text())
+    feeder_ej = pl.apply_network_overrides(feeder_ej, cfg, log=log)
 
     # ② timeseries ---------------------------------------------------------
     df_long = pl.stage_prepare_timeseries(REPO, cfg, meter_files=args.meter,
                                           log=log)
+
+    # ②b scale (stress test) ----------------------------------------------
+    # Before ③/④/⑤ so preflight, the donor pool and the bundles all see the
+    # same scaled world.
+    df_long = pl.stage_scale_load(df_long, cfg, log=log)
 
     # ③ select -------------------------------------------------------------
     substations, nmi_index = pl.stage_select_feeder(
@@ -190,9 +244,9 @@ def main():
         pf_dir = run_dir / "preflight"
         pf_dir.mkdir(exist_ok=True)
         (pf_dir / "preflight_report.md").write_text(
-            pfl.render_markdown(findings, f"Preflight — {feeder_name} {run_id}"))
+            pfl.render_markdown(findings, f"Preflight — {feeder_name} {run_id}"), encoding="utf-8")
         (pf_dir / "preflight_report.json").write_text(
-            json.dumps(findings, indent=1, default=str))
+            json.dumps(findings, indent=1, default=str), encoding="utf-8")
         pd.DataFrame(summary_rows).to_csv(pf_dir / "preflight_summary.csv",
                                           index=False)
         pfl.print_findings(findings, log=log)
@@ -205,6 +259,36 @@ def main():
     # ⑤ pre-index ----------------------------------------------------------
     bundles = pl.stage_preindex(substations, nmi_index, df_long, ambient,
                                 repo=REPO, feeder_name=feeder_name, log=log)
+
+    # ⑤b synthesise --------------------------------------------------------
+    # NMIs in the network with no meter data are otherwise invisible to the
+    # power flow. --no-synthetic reproduces the old (under-loaded) behaviour
+    # for comparison.
+    if not args.no_synthetic:
+        bundles, syn_reports = pl.stage_synthesise(
+            substations, bundles, cfg, run_dir=run_dir, repo=REPO,
+            feeder_name=feeder_name, log=log)
+        if syn_reports:
+            from converge_soe import synthetic as _syn
+            syn_findings = _syn.findings(syn_reports)
+            # Only surface the ones that need a decision. Printing INFO
+            # findings through print_findings emits a bare "READY", which
+            # reads like a second preflight run.
+            loud = [f for f in syn_findings if f["severity"] in ("WARN", "ERROR")]
+            for f in loud:
+                log(f"  [{f['severity']:5}] {f['id']} ({f['scope']}): "
+                    f"{f['message']}")
+            n_syn = sum(r["n_gaps"] for r in syn_reports)
+            if n_syn:
+                log(f"stage ⑤b synthesise: {n_syn} synthetic NMI(s) across "
+                    f"{sum(1 for r in syn_reports if r['n_gaps'])} substation(s)"
+                    f" — they load the network but receive no envelope")
+            if syn_findings:
+                (run_dir / "synthetic_findings.json").write_text(
+                    json.dumps(syn_findings, indent=1, default=str),
+                    encoding="utf-8")
+    else:
+        log("stage ⑤b synthesise: skipped (--no-synthetic)")
 
     if args.dry_run:
         n_steps = next(iter(bundles.values()))["P"].shape[0] if bundles else 0
