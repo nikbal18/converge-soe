@@ -166,7 +166,7 @@ def main():
 
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(buf.getvalue())
+    out.write_text(buf.getvalue(), encoding="utf-8")
     print(buf.getvalue()[:2200])
     print(f"\nFull report written to {out}")
 

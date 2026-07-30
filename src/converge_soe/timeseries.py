@@ -48,6 +48,13 @@ _TS_FORMATS = [
     "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M",
     "%Y-%m-%dT%H:%M", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M",
     "%Y-%m-%d", "%d/%m/%Y", "%H:%M",
+    # Day-first ISO-like variants, listed last so single-sample detection is
+    # unchanged. They exist so detect_column_format can SEE the ambiguity:
+    # data/meter/project_format.csv writes 1-3 June as 2023-01-06/02-06/03-06,
+    # which is day-first, but without these candidates only the month-first
+    # reading fits and the file silently becomes 6 Jan / 6 Feb / 6 Mar.
+    "%Y-%d-%m %H:%M:%S", "%Y-%d-%mT%H:%M:%S", "%Y-%d-%m %H:%M",
+    "%Y-%d-%mT%H:%M", "%Y-%d-%m",
 ]
 
 
@@ -61,17 +68,99 @@ def detect_timestamp_format(sample):
     return None
 
 
+def detect_column_format(values, dayfirst=True):
+    """Pick a timestamp format that fits EVERY distinct value in a column.
+
+    ``detect_timestamp_format`` looks at one sample and returns the first
+    format that parses it, which silently mis-reads ambiguous dates. On
+    data/meter/project_format.csv the distinct dates are 2023-01-06,
+    2023-02-06 and 2023-03-06 — days 1-3 of June, written day-first. Judged
+    from the first value alone they match ``%Y-%m-%d`` and become 6 January,
+    6 February and 6 March: wrong day AND wrong month, with no error.
+
+    Testing against the whole column rules out formats that fit the sample by
+    luck. When both day-first and month-first still fit (every field <= 12) the
+    data cannot disambiguate itself, so ``dayfirst`` decides and we say so.
+    """
+    vals = pd.Series(pd.unique(pd.Series(values).astype(str).str.strip()))
+    if vals.empty:
+        return None
+    fits = []
+    for fmt in _TS_FORMATS:
+        try:
+            pd.to_datetime(vals, format=fmt)
+            fits.append(fmt)
+        except (ValueError, TypeError):
+            continue
+    if not fits:
+        return None
+    df_fmts = [f for f in fits if f.index("%d") < f.index("%m")] if all(
+        "%d" in f and "%m" in f for f in fits) else []
+    mf_fmts = [f for f in fits if f not in df_fmts]
+    if df_fmts and mf_fmts:
+        # Both readings parse. Interval meter data is CONTIGUOUS, so the
+        # correct reading is the one whose dates sit close together: the field
+        # that varies across a short export is the day, not the month. On
+        # project_format.csv day-first gives 1-3 June (2 days apart) while
+        # month-first gives 6 Jan / 6 Feb / 6 Mar (59 days apart); on
+        # forecast_timeseries.csv it is the other way round. A single global
+        # dayfirst flag gets one of them wrong, so decide per column and only
+        # fall back to ``dayfirst`` when the spans genuinely tie.
+        def span(fmt):
+            t = pd.to_datetime(vals, format=fmt)
+            return (t.max() - t.min()).total_seconds()
+
+        d_fmt, m_fmt = df_fmts[0], mf_fmts[0]
+        d_span, m_span = span(d_fmt), span(m_fmt)
+        if d_span != m_span:
+            chosen = d_fmt if d_span < m_span else m_fmt
+            reason = f"contiguity ({min(d_span, m_span)/86400:.0f}d vs " \
+                     f"{max(d_span, m_span)/86400:.0f}d span)"
+        else:
+            chosen = d_fmt if dayfirst else m_fmt
+            reason = f"dayfirst={dayfirst} (spans tie)"
+        logger.info(
+            "ambiguous timestamps (all day/month fields <= 12): %r -> %s under "
+            "%s, %s under %s. Chose %s by %s.",
+            vals.iloc[0],
+            pd.to_datetime(vals, format=d_fmt).min().date(), d_fmt,
+            pd.to_datetime(vals, format=m_fmt).min().date(), m_fmt,
+            chosen, reason)
+        return chosen
+    return fits[0]
+
+
+_HOUR_24 = re.compile(r"(?<=\s)24:00")
+
+
 def parse_timestamps(series):
-    """Parse a timestamp column with an explicit format when one fits."""
-    fmt = detect_timestamp_format(series.iloc[0]) if len(series) else None
+    """Parse a timestamp column with an explicit format when one fits.
+
+    Handles hour 24. NEM interval data labels the interval ENDING at midnight
+    as ``24:00`` on the current day; Python has no such hour and pandas raises
+    (``time data "2023-01-06 24:00" doesn't match format``). Those stamps are
+    rewritten to ``00:00`` on the FOLLOWING day, which is the same instant.
+    data/meter/project_format.csv carries 1095 of them.
+    """
+    s = series.astype(str).str.strip()
+    is24 = s.str.contains(_HOUR_24, na=False)
+    n24 = int(is24.sum())
+    if n24:
+        s = s.mask(is24, s.str.replace(_HOUR_24, "00:00", regex=True))
+        logger.info("rewrote %d '24:00' timestamp(s) to 00:00 the next day "
+                    "(NEM interval-ending convention)", n24)
+    roll = pd.to_timedelta(is24.astype(int), unit="D")
+
+    fmt = detect_column_format(s) if len(s) else None
     if fmt:
         try:
-            return pd.to_datetime(series, format=fmt), fmt
+            return pd.to_datetime(s, format=fmt) + roll, fmt
         except (ValueError, TypeError):
             pass
     logger.warning("timestamp format could not be pinned down from %r; "
-                   "falling back to dateutil (slow)", series.iloc[0] if len(series) else None)
-    return pd.to_datetime(series, dayfirst=True), None
+                   "falling back to dateutil (slow)",
+                   s.iloc[0] if len(s) else None)
+    return pd.to_datetime(s, dayfirst=True) + roll, None
 
 
 # ---------------------------------------------------------------------------

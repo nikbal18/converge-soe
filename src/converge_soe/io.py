@@ -184,7 +184,7 @@ class SubstationWriter:
             "code_version": self.code_version,
         }
         tmp = self.outdir / "_checkpoint.json.tmp"
-        tmp.write_text(json.dumps(ck, indent=1, default=str))
+        tmp.write_text(json.dumps(ck, indent=1, default=str), encoding="utf-8")
         os.replace(tmp, self.outdir / "_checkpoint.json")
 
     def close(self):
@@ -266,7 +266,7 @@ def update_run_manifest(run_dir, substation, scenario, status, **extra):
             manifest = {}
     manifest.setdefault(scenario, {})[substation] = {"status": status, **extra}
     tmp = run_dir / "_manifest.json.tmp"
-    tmp.write_text(json.dumps(manifest, indent=1, default=str))
+    tmp.write_text(json.dumps(manifest, indent=1, default=str), encoding="utf-8")
     os.replace(tmp, p)
     return manifest
 

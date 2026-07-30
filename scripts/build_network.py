@@ -29,7 +29,7 @@ def main():
         m = pl.read_manifest(REPO)
         m.pop("network", None)
         import json
-        pl._manifest_path(REPO).write_text(json.dumps(m))
+        pl._manifest_path(REPO).write_text(json.dumps(m), encoding="utf-8")
     out = pl.stage_build_network(REPO, pl.load_config(REPO), log=print)
     if args.list_feeders:
         df = pl.list_feeders(REPO)

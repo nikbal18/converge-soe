@@ -185,7 +185,7 @@ theta_HS_max: {p['theta_HS_max']}         # °C — hot-spot temperature limit (
 dt: {p['dt']}                    # min — timestep; MUST equal the timeseries interval.
                             #     The pipeline overrides this from the data and
                             #     preflight PHY005 errors on a mismatch.
-""")
+""", encoding="utf-8")
 
 
 def plan():

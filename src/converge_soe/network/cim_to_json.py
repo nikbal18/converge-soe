@@ -614,13 +614,31 @@ def build_network(data, args):
                 z_sec = [1e-6, 1e-6]
                 warnings["tx_z_default"] += 1
 
+            # Taps: only ever from a real RatioTapChanger. Distribution
+            # transformers are modelled at nominal ratio.
+            #
+            # The DMS LVNetwork export carries NO tap elements at all — no
+            # neutralTap, normalTap, numberOfTaps or tapPercent. The previous
+            # fallback (int(... or 1) differences, with a 1.25% default step)
+            # therefore invented tap positions: on Gold Creek it produced taps
+            # scattered over {-1,0,1,2,3,4} with two different step sizes on
+            # one feeder, shifting LV voltages by up to +7.5% and pushing 99.7%
+            # of nodes over the 1.10 pu limit before any load was applied.
+            #
+            # An 11 kV/415 V distribution transformer has off-load taps that
+            # are set at installation and effectively never moved, so nominal
+            # is both the honest and the useful model. Fabricated values are
+            # worse than none.
             tc = data["tap_changers"].get(e1["id"]) or data["tap_changers"].get(e2["id"])
             if tc:
                 tap_range = [tc["low"] - tc["neutral"], tc["high"] - tc["neutral"]]
                 tap = tc["normal"] - tc["neutral"]
+                tap_factor = (e1["tap_pct"] or 1.25) / 100.0
             else:
-                tap_range = [e1["neutral_tap"] - e1["normal_tap"], e1["n_taps"] - e1["normal_tap"]]
-                tap = e1["normal_tap"] - e1["neutral_tap"]
+                tap_range = [0, 0]
+                tap = 0
+                tap_factor = 0.0
+                warnings["tx_no_tap_data"] += 1
 
             sub = data["feeder_objects"].get(data["transformers"][eid]["container"], "")
             vg_actual = f'{e1["conn"]}{e2["conn"].lower()}{e2["clock"]}'
@@ -630,7 +648,7 @@ def build_network(data, args):
                 "in_service": True,
                 "nom_turns_ratio": [u1 / u2, 0.0],
                 "s_max": s_mva,
-                "tap_factor": (e1["tap_pct"] or 1.25) / 100.0,
+                "tap_factor": tap_factor,
                 "tap_range": tap_range,
                 "tap_side": "primary",
                 "taps": [tap],
@@ -643,8 +661,9 @@ def build_network(data, args):
                     "s_rated": s_mva,
                     "vector_group_actual": vg_actual,
                     "inferred": ["vector_group"],
-                    "normal_tap": tc["normal"] if tc else e1["normal_tap"],
-                    "tap": tc["normal"] if tc else e1["normal_tap"],
+                    "normal_tap": tc["normal"] if tc else 0,
+                    "tap": tc["normal"] if tc else 0,
+                    "tap_source": "RatioTapChanger" if tc else "none_in_export",
                 },
             }}
 

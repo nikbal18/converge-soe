@@ -78,9 +78,9 @@ def main():
     out = Path(args.out) if args.out else Path(args.network).parent
     out.mkdir(parents=True, exist_ok=True)
     (out / "preflight_report.md").write_text(
-        pfl.render_markdown(findings, f"Preflight — {Path(args.network).name}"))
+        pfl.render_markdown(findings, f"Preflight — {Path(args.network).name}"), encoding="utf-8")
     (out / "preflight_report.json").write_text(
-        json.dumps(findings, indent=1, default=str))
+        json.dumps(findings, indent=1, default=str), encoding="utf-8")
     pd.DataFrame([pfl.summary_row(Path(args.network).stem, findings,
                                   bundle, ej)]).to_csv(
         out / "preflight_summary.csv", index=False)

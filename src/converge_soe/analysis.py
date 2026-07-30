@@ -58,6 +58,44 @@ def run_analysis(run_dir, cfg, feeder_name="FEEDER", log=logger.info,
         return None
     subs_all = sorted({s for subs in found.values() for s in subs})
 
+    # ---- common intervals --------------------------------------------------
+    # Scenarios MUST be compared over the same set of intervals. A solver
+    # failure in one scenario but not another makes the E_curt sums
+    # incomparable: on GOLDCR_8HB_LEXCEN doe_dtr solved 46 steps and
+    # doe_static 42, which made DTR look like it curtailed MORE than static
+    # (504 vs 444 kWh) when on the 41 shared intervals it curtailed less
+    # (443.06 vs 444.04) — i.e. the sanity check fired on an artefact.
+    common_ts = {}
+    for sc, subs in found.items():
+        for sub in subs:
+            d = _read(run_dir, sc, sub, "doe")
+            if d is None or not len(d):
+                continue
+            ts = set(d["timestamp"].unique())
+            common_ts[sub] = ts if sub not in common_ts else (common_ts[sub] & ts)
+
+    dropped = {}
+    for sc, subs in found.items():
+        for sub in subs:
+            d = _read(run_dir, sc, sub, "doe")
+            if d is None or not len(d) or sub not in common_ts:
+                continue
+            n = d["timestamp"].nunique() - len(common_ts[sub])
+            if n:
+                dropped[(sc, sub)] = n
+    if dropped:
+        for (sc, sub), n in sorted(dropped.items()):
+            logger.warning("analysis: %s/%s — %d interval(s) excluded so every "
+                           "scenario is compared over the same %d intervals",
+                           sc, sub, n, len(common_ts[sub]))
+
+    def _restrict(df, sub):
+        if df is None or not len(df) or sub not in common_ts:
+            return df
+        if "timestamp" not in df.columns:
+            return df
+        return df[df["timestamp"].isin(common_ts[sub])]
+
     # ---- metrics per substation × scenario --------------------------------
     rows = []
     thermal_cache = {}
@@ -65,9 +103,9 @@ def run_analysis(run_dir, cfg, feeder_name="FEEDER", log=logger.info,
     viol_cache = {}
     for sc, subs in found.items():
         for sub in subs:
-            doe = _read(run_dir, sc, sub, "doe")
-            th = _read(run_dir, sc, sub, "thermal")
-            vl = _read(run_dir, sc, sub, "viol")
+            doe = _restrict(_read(run_dir, sc, sub, "doe"), sub)
+            th = _restrict(_read(run_dir, sc, sub, "thermal"), sub)
+            vl = _restrict(_read(run_dir, sc, sub, "viol"), sub)
             doe_cache[(sc, sub)] = doe
             thermal_cache[(sc, sub)] = th
             viol_cache[(sc, sub)] = vl
@@ -179,7 +217,7 @@ def run_analysis(run_dir, cfg, feeder_name="FEEDER", log=logger.info,
         n_fail += ok is False
         lines.append(f"- **{tag}** {name}" + (f" — {detail}" if detail else ""))
         log(f"  [{tag}] {name}" + (f" — {detail}" if detail else ""))
-    (comp / "sanity_checks.md").write_text("\n".join(lines) + "\n")
+    (comp / "sanity_checks.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     write_run_summary(run_dir, feeder_name, cfg, mdf, feeder_tot, checks)
     log(f"analysis written to {comp}")
@@ -262,6 +300,13 @@ def sanity_checks(mdf, thermal_cache, doe_cache, found, theta_max, run_dir):
             if (Path(run_dir) / "scenarios" / sc / sub / "branch.parquet").exists() else None
         if br is None:
             continue
+        # This is an INTERNAL consistency check on one scenario, not a
+        # cross-scenario comparison, so both sides must cover the same
+        # intervals. doe_cache is restricted to the intervals every scenario
+        # solved; branch.parquet is not, so restrict it the same way or the
+        # residual is pure sampling mismatch (43% on S_5402_AT).
+        if "timestamp" in br.columns and len(doe):
+            br = br[br["timestamp"].isin(set(doe["timestamp"].unique()))]
         # transformer = branch whose id appears in thermal table
         th = thermal_cache.get((sc, sub))
         if th is None or not len(th):
@@ -326,4 +371,4 @@ def write_run_summary(run_dir, feeder_name, cfg, mdf, feeder_tot, checks):
               "`scenarios/<scenario>/<substation>/` for full per-timestep "
               "parquet, `preflight/` for the input checks. "
               "See docs/RESULTS_GUIDE.md for how to read every number.", ""]
-    (run_dir / "RUN_SUMMARY.md").write_text("\n".join(lines))
+    (run_dir / "RUN_SUMMARY.md").write_text("\n".join(lines), encoding="utf-8")
