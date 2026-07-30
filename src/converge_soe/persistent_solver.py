@@ -44,6 +44,7 @@ from pyomo.environ import (
 from pyomo.common.errors import ApplicationError
 
 from . import thermal as _thermal
+from .doe_solver import S_BASE_VA
 from .doe_solver import SoeSolver as _DoeSolver, _oe_idxs, _kw_to_pu, _w_to_pu
 
 logger = logging.getLogger(__name__)
@@ -410,10 +411,10 @@ class PersistentDoeSolver:
         branch = pd.DataFrame({
             "current_a_oel": [np.sqrt(abs(m.square_current_pu[b, "oel"].value)) for b in net.branches.index] * np.ones(1),
             "current_a_oer": [np.sqrt(abs(m.square_current_pu[b, "oer"].value)) for b in net.branches.index] * np.ones(1),
-            "p_w_oel": [m.branch_active_pu[b, "oel"].value * 1e6 for b in net.branches.index],
-            "p_w_oer": [m.branch_active_pu[b, "oer"].value * 1e6 for b in net.branches.index],
-            "q_va_oel": [m.branch_reactive_pu[b, "oel"].value * 1e6 for b in net.branches.index],
-            "q_va_oer": [m.branch_reactive_pu[b, "oer"].value * 1e6 for b in net.branches.index],
+            "p_w_oel": [m.branch_active_pu[b, "oel"].value * S_BASE_VA for b in net.branches.index],
+            "p_w_oer": [m.branch_active_pu[b, "oer"].value * S_BASE_VA for b in net.branches.index],
+            "q_va_oel": [m.branch_reactive_pu[b, "oel"].value * S_BASE_VA for b in net.branches.index],
+            "q_va_oer": [m.branch_reactive_pu[b, "oer"].value * S_BASE_VA for b in net.branches.index],
         }, index=pd.Index(net.branches.index, name="id"))
         branch["current_a_oel"] *= ib
         branch["current_a_oer"] *= ib

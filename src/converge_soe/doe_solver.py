@@ -1,6 +1,8 @@
 from collections import namedtuple
 import contextlib
 import logging
+import os
+from pathlib import Path
 
 from pyomo.environ import (
     ConcreteModel, ConstraintList, NonNegativeReals, Objective, minimize, pyomo, Reals, SolverFactory, Var
@@ -18,7 +20,39 @@ logger = logging.getLogger(__name__)
 #netw_json - dictionary describing the physical grid. 
 #df_forecasts - for each customer, a df that describes each customer, what power they are expected to consume in the next 5-minute interval
 #df_offers - df - which customers are willing to be dispatched and at what price?
-_s_base_va = 1.0e6
+# THE per-unit power base. Everything downstream derives from it: z_base,
+# i_base, the kW/W conversions, and the branch-power reporting in scenarios.py
+# and persistent_solver.py — which used to hardcode 1.0e6 in eight places, so
+# changing this constant alone silently corrupted the thermal trajectory. They
+# now import S_BASE_VA; change it HERE and only here.
+#
+# Why it matters numerically: LV customers draw kilowatts, so on a 1 MVA base
+# the power variables sit at 1e-3 to 1e-6 pu. Combined with impedances from
+# 5e-5 to 1.3 pu, the KKT matrix spans ~10 orders of magnitude and MUMPS
+# struggles to factorise it ("EXIT: Error in step computation"). Lowering the
+# base to 1e4 puts the power variables near 1. Re-run the sanity checks after
+# any change: the DistFlow residual and the BAU energy balance will catch a
+# mismatch immediately.
+S_BASE_VA = 1.0e6
+_s_base_va = S_BASE_VA
+
+# Applied only to a RETRY, after a first attempt has already failed.
+#   mu_strategy=adaptive     — vary the barrier parameter instead of the
+#                              monotone schedule; much better on hard problems
+#   bound_relax_factor       — let iterates sit slightly outside bounds rather
+#                              than fighting an active bound with a huge
+#                              multiplier
+#   max_iter / max_cpu_time  — give the harder path room, but still bounded
+#   honor_original_bounds=no — do not project the answer back onto the bounds
+# (linear_system_scaling=mc19 would help too, but MC19 is part of HSL and is
+#  not available in a MUMPS-only ipopt build.)
+_ROBUST_OPTIONS = {
+    "mu_strategy": "adaptive",
+    "bound_relax_factor": 1e-6,
+    "honor_original_bounds": "no",
+    "max_iter": 5000,
+    "max_cpu_time": 180.0,
+}
 _kw_to_pu = 1000.0 / _s_base_va  # kW to pu
 _w_to_pu = 1.0 / _s_base_va  # kW to pu
 _pu_to_w = _s_base_va  # kW to pu
@@ -53,7 +87,9 @@ class SoeSolver:
                  soft_limits: bool = False, soft_limit_penalty: float = 1000.0,
                  quiet: bool = False, warm_start_in: dict = None,
                  solver_name: str = "ipopt", network_cache=None,
-                 usable_export_weight: float = 0.0):
+                 usable_export_weight: float = 0.0,
+                 max_cpu_time: float = 120.0,
+                 retry_on_failure: bool = True):
         self.netw_ejson = netw_ejson
         self.netw_ejson["components"] = dict(sorted(self.netw_ejson["components"].items()))  # For reprod/testing
         # pandas df with forecast power consumption for each customer.
@@ -114,6 +150,11 @@ class SoeSolver:
         # DEGENERATE — mathematically any split is optimal, so curtailment
         # metrics become arbitrary. The pipeline scenarios enable this.
         self.usable_export_weight = float(usable_export_weight)
+        # Wall-clock cap per solve, and one retry with a more robust barrier
+        # configuration when the first attempt fails. See _ROBUST_OPTIONS.
+        self.max_cpu_time = float(max_cpu_time)
+        self.retry_on_failure = bool(retry_on_failure)
+        self.n_retries_used = 0
         # Optional pre-parsed network data (Path A of the speed work): the
         # network is constant for a given substation, so the ejson parse and
         # per-unit conversion can be done once and reused for every timestep.
@@ -280,7 +321,16 @@ class SoeSolver:
                     "x_ohm": z_ohm[1] * length,
                     "r0_ohm": z0_ohm[0] * length,
                     "x0_ohm": z0_ohm[1] * length,
-                    "i_max_a": cd["i_max"] * i_units if "i_max" in cd else 100000.0,  # From old vers: 100 kA
+                    # No rating in the export -> NO current constraint on this
+                    # line (the constraint below is only added where i_max_pu
+                    # is not NaN). The old 100 kA placeholder was equivalent
+                    # physically — it never bound — but it was actively harmful
+                    # numerically: it put i_max_pu = 40 alongside real limits of
+                    # 0.04, a 1000x spread in the constraint matrix, and added
+                    # hundreds of constraints per substation that could never
+                    # be active. Preflight NET009 still reports the missing
+                    # ratings, so the modelling gap stays visible.
+                    "i_max_a": cd["i_max"] * i_units if "i_max" in cd else np.nan,
                     "transformer_bus_id": None,
                     # transformer_bus_id is just to_bus for transformers, but keep this for clarity / to make things
                     # more similar to previous code.
@@ -329,6 +379,7 @@ class SoeSolver:
             )
 
         self.branches = pd.DataFrame.from_records(branches_list).set_index("id")
+        self._orient_branches_from_source(ej_nodes)
         add_i(self.branches)
 
         self.transformer_buses = list(self.transformer_buses)
@@ -365,6 +416,80 @@ class SoeSolver:
         sel_lines = self.branches["voltage_ratio_pu"].isna()
         self.lines = self.branches.loc[sel_lines]
         self.transformers = self.branches.loc[~sel_lines]
+
+    def _orient_branches_from_source(self, ej_nodes):
+        '''Orient every branch away from the infeeder (from_bus = upstream).
+
+        THIS IS LOAD-BEARING. The DistFlow balance is
+
+            branch_active_pu[b] == sum(a_bus_pu[b.to_bus]) + r*i^2
+                                   + sum(branch_active_pu[downstream of b.to_bus])
+
+        which assumes each branch's ``to_bus`` is its DOWNSTREAM end. CIM
+        exports carry arbitrary edge orientation: on GOLDCR_8HB_LEXCEN,
+        152 of 306 branches pointed back towards the source, so 58 of 59 load
+        buses were never any branch's ``to_bus``. Their power contributed to no
+        balance at all and simply vanished — the model solved happily with
+        ~0 A everywhere (the i^2*v^2 == P^2+Q^2 equality was satisfied because
+        both sides were zero), every envelope went to the ``envelope_abs_max``
+        cap unopposed, the transformer never heated, and doe_dtr was always
+        identical to doe_static.
+
+        BAU was never affected: ``scenarios.run_bau_scenario`` builds its own
+        undirected adjacency and does a proper rooted traversal.
+
+        Swapping a transformer's ends also inverts its voltage ratio, and the
+        LV side (``transformer_bus_id``) follows the new ``to_bus``.
+        '''
+        from collections import defaultdict, deque
+
+        srcs = [c[0]["cons"][0]["node"]
+                for _, ctp, c in [(k, t, [d]) for k, t, d in
+                                  _netw_components(self.netw_ejson, "Infeeder")]]
+        if not srcs:
+            logger.warning("no Infeeder: branch orientation left as imported; "
+                           "the power balance may be wrong")
+            return
+        root = srcs[0]
+
+        adj = defaultdict(list)
+        for b_id, r in self.branches.iterrows():
+            adj[r["from_bus_id"]].append((b_id, r["to_bus_id"]))
+            adj[r["to_bus_id"]].append((b_id, r["from_bus_id"]))
+
+        seen, flipped, visited = {root}, [], set()
+        q = deque([root])
+        while q:
+            n = q.popleft()
+            for b_id, m in adj[n]:
+                if b_id in visited:
+                    continue
+                visited.add(b_id)
+                if m in seen:        # closes a loop — not a radial tree
+                    continue
+                seen.add(m)
+                q.append(m)
+                if self.branches.at[b_id, "from_bus_id"] != n:
+                    flipped.append(b_id)
+
+        for b_id in flipped:
+            row = self.branches.loc[b_id]
+            self.branches.at[b_id, "from_bus_id"] = row["to_bus_id"]
+            self.branches.at[b_id, "to_bus_id"] = row["from_bus_id"]
+            vr = row["voltage_ratio_pu"]
+            if pd.notna(vr) and vr != 0:
+                self.branches.at[b_id, "voltage_ratio_pu"] = 1.0 / vr
+                self.branches.at[b_id, "transformer_bus_id"] = row["from_bus_id"]
+
+        unreached = len(self.buses) - len(seen)
+        if flipped and not self.quiet:
+            logger.info("oriented %d/%d branch(es) away from the source",
+                        len(flipped), len(self.branches))
+        if unreached:
+            logger.warning(
+                "%d bus(es) not reachable from the infeeder — their loads "
+                "contribute to no branch balance and will be ignored by the "
+                "power flow", unreached)
 
     def _apply_dtr_limits(self):
         # Dynamic thermal rating (Phase 1): replace each transformer's static
@@ -434,22 +559,49 @@ class SoeSolver:
         # fall back to flat-start values otherwise.
         ws = self.warm_start_in
 
-        def init_from(ws_key, fallback):
+        def init_from(ws_key, fallback, lo=None, hi=None):
+            """Initialiser from the previous solve, clamped into bounds.
+
+            A converged square_current_pu is routinely ~1e-32 — numerically
+            zero, but below the 1e-8 lower bound. Feeding it back verbatim made
+            Pyomo emit a W1002 'outside the bounds' warning per variable per
+            timestep (thousands per run) for what is a harmless rounding
+            artefact. Clamping keeps the warm start while staying feasible.
+            """
             prev = ws.get(ws_key) or {}
+
             def _init(m, *idx):
-                return prev.get(idx if len(idx) > 1 else idx[0], fallback)
+                v = prev.get(idx if len(idx) > 1 else idx[0], fallback)
+                if lo is not None and v < lo:
+                    return lo
+                if hi is not None and v > hi:
+                    return hi
+                return v
             return _init
 
         self.model.square_voltage_pu = Var(
             bus_oe_idxs, name="square_voltage_pu", domain=NonNegativeReals,
             bounds=(0.5 ** 2, 1.5 ** 2),
-            initialize=init_from("square_voltage_pu", 1.0)
+            initialize=init_from("square_voltage_pu", 1.0,
+                                 lo=0.5 ** 2, hi=1.5 ** 2)
         )
 
+        # Lower bound on i^2. The 1e-8 floor exists to keep ipopt away from
+        # (K2 + eps)**m with m ~ 0.8, whose derivative is unbounded at K2 = 0 —
+        # but that term ONLY appears in the legacy thermal constraint, and it
+        # already carries its own eps = 1e-6 guard. In dtr/static mode there is
+        # no such term, and the floor is actively harmful: a lightly-loaded
+        # branch genuinely wants i^2 ~ 1e-32, so the bound becomes active with
+        # a huge multiplier and wrecks the conditioning of the KKT system.
+        # (This is what the W1002 flood was telling us.) Zero is safe: the
+        # variable is NonNegativeReals and the i^2*v^2 == P^2+Q^2 equality
+        # pins it.
+        _i2_lo = 1e-8 if self.tx_limit == "legacy" else 0.0
         self.model.square_current_pu = Var(
             branch_oe_idxs, name="square_current_pu", domain=NonNegativeReals,
-            bounds=(1e-8, None),
-            initialize=init_from("square_current_pu", 1e-8)
+            bounds=(_i2_lo, None),
+            initialize=init_from("square_current_pu", max(_i2_lo, 1e-12),
+                                 lo=_i2_lo)
         )
         self.model.branch_active_pu = Var(
             branch_oe_idxs, name="branch_active_pu", domain=Reals,
@@ -760,13 +912,63 @@ class SoeSolver:
             # measurable overhead across tens of thousands of timesteps.
             solver.options['print_level'] = 0
             solver.options['sb'] = 'yes'
-            solver.options['file_print_level'] = 0
+            # Capture ipopt's own diagnosis to a scratch file. Without this the
+            # only thing recorded on failure is Pyomo's wrapper ValueError
+            # ("Cannot load a SolverResults object with bad status: error"),
+            # which says nothing about WHY — restoration failure, too few
+            # degrees of freedom, evaluation error and genuine infeasibility
+            # all look identical. Costs one small file per failed solve.
+            import tempfile as _tf
+            _log = Path(_tf.gettempdir()) / f"ipopt_{os.getpid()}.log"
+            solver.options['file_print_level'] = 5
+            solver.options['output_file'] = str(_log)
+            # Wall-clock cap. Without one, a single pathological interval ran
+            # for 5189 s (86 minutes) and held a whole run hostage. Losing that
+            # interval costs one row; losing the afternoon costs the run.
+            solver.options.setdefault('max_cpu_time', float(self.max_cpu_time))
+
+            def _ipopt_verdict():
+                try:
+                    if _log.exists():
+                        lines = [ln.strip() for ln in
+                                 _log.read_text(errors="replace").splitlines()
+                                 if ln.strip()]
+                        return " | ".join(lines[-3:])[:300]
+                except Exception:
+                    pass
+                return ""
+
             try:
                 results = solver.solve(self.model, tee=False)
             except (ApplicationError, ValueError, OSError) as e:
+                first = f"{type(e).__name__}: {e}"
+                verdict = _ipopt_verdict()
+
+                # Retry once with a more robust barrier configuration. These
+                # failures are dominated by "Error in step computation" — the
+                # KKT factorisation failing on a marginally-conditioned model,
+                # not genuine infeasibility — and an adaptive barrier with
+                # relaxed bounds recovers most of them. Only failed intervals
+                # pay this cost.
+                if self.retry_on_failure:
+                    for k, v in _ROBUST_OPTIONS.items():
+                        solver.options[k] = v
+                    try:
+                        results = solver.solve(self.model, tee=False)
+                        self.last_solve_error = None
+                        self.n_retries_used = getattr(self, "n_retries_used", 0) + 1
+                        logger.info("solver recovered on retry (first attempt: "
+                                    "%s)", verdict or first)
+                        return results['Solver'][0].status
+                    except (ApplicationError, ValueError, OSError) as e2:
+                        verdict = _ipopt_verdict() or verdict
+                        first = f"{first} | retry: {type(e2).__name__}: {e2}"
+
                 # One bad interval must never kill a year-long run: record and
                 # report as an error status; the caller logs and continues.
-                self.last_solve_error = f"{type(e).__name__}: {e}"
+                self.last_solve_error = first
+                if verdict:
+                    self.last_solve_error += f" — ipopt: {verdict}"
                 logger.error("solver failed: %s", self.last_solve_error)
                 return pyomo.opt.SolverStatus.error
         else:
@@ -924,18 +1126,33 @@ class SoeSolver:
     def _calculate_bus_loads_kw(self, bus_idxs):
         '''
         Calculate local active and reactive background load at each bus.
-        For participant NMIs, we don't include the active power forecast, as the active power will be
-        treated separately as the envelope limits.
+
+        For PARTICIPANT NMIs we don't include the active power forecast, as the
+        active power is treated separately as the envelope limits.
+
+        For NON-PARTICIPANT NMIs the active power IS background load and must be
+        included, or they are electrically invisible to the power flow. Two
+        populations land here:
+          * NMIs with real meter data that were excluded from participation
+            (participant_load_ids given as a subset);
+          * NMIs with no meter data at all, given a synthetic profile by
+            synthetic.py — no meter means no envelope can be issued to them,
+            but they still load the network.
+        Omitting them makes the feeder look unloaded and the envelopes come out
+        far too generous.
         '''
 
         bus_ld_a_kw = {bus_id: 0.0 for bus_id in bus_idxs for oe in _oe_idxs}
         bus_ld_r_kw = {bus_id: 0.0 for bus_id in bus_idxs for oe in _oe_idxs}
+        partic = set(self.partic_load_ids)
         for load_row in self.loads.itertuples():
             load_id = load_row.Index
             bus_id = load_row.bus_id
 
             if load_id in self.forecast_load_ids:
                 bus_ld_r_kw[bus_id] += self.df_forecasts_filt.loc[load_id, "reactive_power_var"] * 1e-3
+                if load_id not in partic:
+                    bus_ld_a_kw[bus_id] += self.df_forecasts_filt.loc[load_id, "real_power_w"] * 1e-3
 
         return (bus_ld_a_kw, bus_ld_r_kw)
 

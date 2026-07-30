@@ -21,6 +21,7 @@ import pandas as pd
 
 from . import thermal as _thermal
 from .doe_solver import SoeSolver as DoeSolver
+from .doe_solver import S_BASE_VA
 from .network import validate as _validate
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,23 @@ def run_doe_scenario(scenario, sub_ej, bundle, transformer_params, cfg,
     idx = pd.DatetimeIndex(bundle["timestamps"].view("datetime64[ns]"))
     load_ids = [str(x) for x in bundle["load_ids"]]
     P, Q, theta = bundle["P"], bundle["Q"], bundle["theta_A"]
+
+    # NMIs given a synthetic profile by synthetic.py have no meter, so no
+    # envelope can be issued to them. They must still load the network — that
+    # is handled by _calculate_bus_loads_kw, which adds active power for every
+    # forecast load that is not a participant. When nothing is synthetic this
+    # is None, i.e. exactly the previous behaviour.
+    # synthetic.participants = true makes the synthetic NMIs participants too.
+    # Physically that is wrong — you cannot issue an envelope to a customer
+    # with no meter — but it isolates what the DOE could achieve if EVERY
+    # customer were dispatchable, which is the upper bound on the mechanism.
+    # With it false (default), synthetic NMIs are uncontrollable background
+    # load, which is what limits the DOE in practice.
+    _syn = np.asarray(
+        bundle.get("synthetic", np.zeros(len(load_ids), dtype=bool)), dtype=bool)
+    _all_participate = bool((cfg.get("synthetic", {}) or {}).get("participants", False))
+    participants = (None if (_all_participate or not _syn.any())
+                    else [lid for lid, s in zip(load_ids, _syn) if not s])
     state = dict(thermal_state or {})
     # THE carried thermal state is the transformer's ACTUAL state: every
     # customer follows their forecast, clipped into [doe_lb, doe_ub]. This is
@@ -76,7 +94,7 @@ def run_doe_scenario(scenario, sub_ej, bundle, transformer_params, cfg,
     for tx_id, entry in comps_t.items():
         cd = entry["Transformer"]
         sec_nd = sub_ej["components"][cd["cons"][1]["node"]]["Node"]
-        z_base = (sec_nd["v_base"] * v_units) ** 2 / 1.0e6
+        z_base = (sec_nd["v_base"] * v_units) ** 2 / S_BASE_VA
         r_pu = (2.0 / 3.0) * cd["z"][1][0] * z_units / z_base
         x_pu = (2.0 / 3.0) * cd["z"][1][1] * z_units / z_base
         tx_rx[tx_id] = (r_pu, x_pu)
@@ -96,11 +114,14 @@ def run_doe_scenario(scenario, sub_ej, bundle, transformer_params, cfg,
     solver_opts = dict(cfg.get("solver", {}).get("options", {}) or {})
     if cfg.get("solver", {}).get("linear_solver"):
         solver_opts.setdefault("linear_solver", cfg["solver"]["linear_solver"])
+    max_cpu = float(cfg.get("solver", {}).get("max_cpu_time", 120.0))
+    retry = bool(cfg.get("solver", {}).get("retry_on_failure", True))
 
     if fast:
         from .persistent_solver import PersistentDoeSolver
         ps = PersistentDoeSolver(
             sub_ej, load_ids, envelope_abs_max=envelope_abs_max,
+            participant_load_ids=participants,
             transformer_params=transformer_params, tx_limit=tx_limit,
             k_emergency=k_emergency, k2_floor=k2_floor,
             soft_limits=soft, soft_limit_penalty=soft_pen,
@@ -134,6 +155,7 @@ def run_doe_scenario(scenario, sub_ej, bundle, transformer_params, cfg,
                                 "reactive_power_var": Q[i].astype(float)},
                                index=pd.Index(load_ids, name="load_id"))
             s = DoeSolver(sub_ej, f_t, envelope_abs_max=envelope_abs_max,
+                          participant_load_ids=participants,
                           transformer_params=transformer_params,
                           theta_A=theta_A, thermal_state_in=dict(state),
                           tx_limit=tx_limit, k_emergency=k_emergency,
@@ -141,7 +163,8 @@ def run_doe_scenario(scenario, sub_ej, bundle, transformer_params, cfg,
                           soft_limit_penalty=soft_pen, quiet=True,
                           warm_start_in=warm, network_cache=net_cache,
                           solver_options=solver_opts, solver_name=solver_name,
-                          usable_export_weight=use_w)
+                          usable_export_weight=use_w,
+                          max_cpu_time=max_cpu, retry_on_failure=retry)
             if net_cache is None:
                 net_cache = s.network_cache()
             status, res = s.solve()
@@ -177,14 +200,14 @@ def run_doe_scenario(scenario, sub_ej, bundle, transformer_params, cfg,
             p_act_kw = np.clip(p_des, lb, ub)          # injection, kW
             p_w_tot = float((-p_act_kw * 1000.0).sum())
             q_var_tot = float(Q[i].sum())
-            p_pu, q_pu = p_w_tot / 1.0e6, q_var_tot / 1.0e6
+            p_pu, q_pu = p_w_tot / S_BASE_VA, q_var_tot / S_BASE_VA
             for tx_id in (envelope_state or comps_t):
                 info = dtr_info.get(tx_id, {})
                 c2 = info.get("c2")
                 if c2 is None:
                     tr = list(comps_t.values())[0]["Transformer"]
                     v_v = tr["v_winding_base"][1] * sub_ej["units"]["voltage"]
-                    i_base = 1.0e6 / v_v
+                    i_base = S_BASE_VA / v_v
                     c2 = (i_base / transformer_params["I_rated"]) ** 2
                 # two fixed-point iterations of I²V² = (P+rI²)² + (Q+xI²)²
                 # so the actual current includes transformer losses, matching
@@ -286,7 +309,7 @@ def run_bau_scenario(sub_ej, bundle, transformer_params, cfg, writer,
     v_units = sub_ej["units"]["voltage"]
     i_units = sub_ej["units"]["current"]
     z_units = sub_ej["units"]["impedance"]
-    s_base = 1.0e6
+    s_base = S_BASE_VA
 
     inf = next(iter(comps["Infeeder"].values()))
     root = inf["cons"][0]["node"]
