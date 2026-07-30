@@ -37,6 +37,18 @@ python scripts/run_feeder.py --feeder GOLDCR_8HB_LEXCEN \
            substation's NMIs, as a plain NumPy array
                  │
                  ▼
+         ⑤b SYNTHESISE  (NMIs with no meter data)
+           the meter export does not cover every NMI on
+           the network. Those without data are not even
+           columns after stage ⑤, so they load the
+           network by exactly 0 kW and the envelopes come
+           out far too generous. Each is given a real
+           profile sampled from the metered NMIs on the
+           same substation — they load the network but
+           never receive an envelope. --no-synthetic
+           reproduces the old behaviour.
+                 │
+                 ▼
           ⑥ SOLVE  × 3 scenarios × every substation
            doe_dtr  │  doe_static  │  bau
                  │

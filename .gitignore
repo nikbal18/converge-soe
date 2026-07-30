@@ -28,6 +28,14 @@ network_conversion/*.json
 *.parquet
 *.npz
 
+# Synthetic profiles for unmapped NMIs. These are REAL metered profiles copied
+# onto other NMI ids, and the report contains a real-NMI -> real-NMI donor map,
+# so they are exactly as confidential as the raw meter data.
+examples/scenario_real/
+**/background_timeseries.csv
+**/disaggregation_report.json
+**/synthetic_report.json
+
 # Real interval-meter / NMI data and anything derived from it
 examples/scenario_2/
 examples/scenario_2/data_translation/lexcen_data.csv

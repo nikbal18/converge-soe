@@ -2,6 +2,26 @@
 
 ## Added
 
+* **`src/converge_soe/synthetic.py` + stage ⑤b** — synthetic profiles for
+  network NMIs with no interval-meter data. Stage ③ only indexes NMIs that
+  matched the meter export, so the rest were not columns in the bundle at all
+  and contributed 0 kW to the power flow: the feeder looked unloaded and the
+  envelopes came out far too generous. On the Gold Creek LV network this was
+  **72 of 121 Loads (60%), carrying ~61% of the real feeder load**.
+  Each gap is filled with a real profile sampled from the metered NMIs on the
+  same substation (rather than a mean profile, which would smooth away the
+  peak and minimum-demand intervals that bind the constraints), matching
+  rooftop PV via `user_data.der`, drawing without replacement, and reporting a
+  diversity flag plus the full donor→target map. Where a substation has fewer
+  than `min_donors` usable donors, it falls back to disaggregating that
+  substation's measured transformer demand *minus* its metered NMIs.
+  Config under `synthetic:`; `--no-synthetic` reproduces the old behaviour so
+  the difference can be quantified.
+  Note: `ESTIMATION − METER_SUMMATION` is **not** the unmetered load — the
+  ratio is a near-constant ~1.03 gross-up for missing meter *reads*, rising to
+  ~2.3 when `METER_COUNT` collapses, and being multiplicative it flips sign
+  with the feeder. See the module docstring.
+
 * **`src/converge_soe/thermal.py`** — IEEE C57.91 forward model, the DTR
   inversion (`dtr_current_limit_pu`, brentq on the strictly-increasing
   end-of-interval θ_HS), open-loop trajectories, and the ageing formulas.
