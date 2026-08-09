@@ -46,12 +46,16 @@ _s_base_va = S_BASE_VA
 #   honor_original_bounds=no — do not project the answer back onto the bounds
 # (linear_system_scaling=mc19 would help too, but MC19 is part of HSL and is
 #  not available in a MUMPS-only ipopt build.)
+# NOTE: no max_cpu_time here. It used to carry 180 s, which OVERRODE a larger
+# configured cap — so a retry after a 600 s timeout got less time than the
+# attempt that had just timed out, guaranteeing a second timeout and burning
+# 780 s per interval to reach the same answer. The retry inherits the
+# configured cap instead.
 _ROBUST_OPTIONS = {
     "mu_strategy": "adaptive",
     "bound_relax_factor": 1e-6,
     "honor_original_bounds": "no",
     "max_iter": 5000,
-    "max_cpu_time": 180.0,
 }
 _kw_to_pu = 1000.0 / _s_base_va  # kW to pu
 _w_to_pu = 1.0 / _s_base_va  # kW to pu
@@ -89,7 +93,8 @@ class SoeSolver:
                  solver_name: str = "ipopt", network_cache=None,
                  usable_export_weight: float = 0.0,
                  max_cpu_time: float = 120.0,
-                 retry_on_failure: bool = True):
+                 retry_on_failure: bool = True,
+                 series_reduction: bool = False):
         self.netw_ejson = netw_ejson
         self.netw_ejson["components"] = dict(sorted(self.netw_ejson["components"].items()))  # For reprod/testing
         # pandas df with forecast power consumption for each customer.
@@ -155,6 +160,10 @@ class SoeSolver:
         self.max_cpu_time = float(max_cpu_time)
         self.retry_on_failure = bool(retry_on_failure)
         self.n_retries_used = 0
+        # Merge line chains through nodes carrying no load. OFF by default so
+        # enabling it is always a deliberate, recorded choice — see
+        # _reduce_series_branches.
+        self.series_reduction = bool(series_reduction)
         # Optional pre-parsed network data (Path A of the speed work): the
         # network is constant for a given substation, so the ejson parse and
         # per-unit conversion can be done once and reused for every timestep.
@@ -380,6 +389,12 @@ class SoeSolver:
 
         self.branches = pd.DataFrame.from_records(branches_list).set_index("id")
         self._orient_branches_from_source(ej_nodes)
+        # getattr, not self.series_reduction: PersistentDoeSolver builds its
+        # base via __new__ and sets attributes by hand, so anything added to
+        # __init__ is absent there unless it is also set in persistent_solver.
+        # Defaulting here keeps --fast working even if that list drifts.
+        if getattr(self, "series_reduction", False):
+            self._reduce_series_branches()
         add_i(self.branches)
 
         self.transformer_buses = list(self.transformer_buses)
@@ -490,6 +505,94 @@ class SoeSolver:
                 "%d bus(es) not reachable from the infeeder — their loads "
                 "contribute to no branch balance and will be ignored by the "
                 "power flow", unreached)
+
+    def _reduce_series_branches(self):
+        '''Merge chains of lines through nodes that carry nothing.
+
+        A distribution LV model contains far more nodes than customers: poles,
+        joints, cable-type changes. The largest substation measured here has
+        950 branches for 148 customers, against 397 for 96 on a smaller one —
+        2.4x the network for a comparable number of loads. The NLP scales
+        superlinearly, so that turned ~12 s per interval into ~200 s.
+
+        A node with exactly two line branches, no load, no transformer and no
+        voltage setpoint injects nothing, so the two branches carry IDENTICAL
+        current and can be replaced by one with
+
+            r = r1 + r2,   x = x1 + x2,   i_max = min(i_max1, i_max2)
+
+        This is exact, not an approximation: with no injection the voltage
+        along the chain is monotonic in the flow, so the extreme voltage is at
+        an endpoint and dropping the interior node's limit cannot hide a
+        violation. The current limit is the tighter of the two because the same
+        current passes through both.
+
+        Preserved and never merged through: load buses, transformer terminals,
+        the infeeder/setpoint bus, and any node joining three or more branches.
+        '''
+        from collections import defaultdict
+
+        keep = set(self.load_buses) | set(self.transformer_buses)
+        keep |= set(self.buses.index[self.buses["v_mag_setpoint_pu"].notna()])
+
+        n_before = len(self.branches)
+        merged_total = 0
+
+        while True:
+            inc = defaultdict(list)
+            for b_id, r in self.branches.iterrows():
+                inc[r["from_bus_id"]].append(b_id)
+                inc[r["to_bus_id"]].append(b_id)
+
+            merged_this_pass = 0
+            done = set()
+            for node, bids in inc.items():
+                if node in keep or len(bids) != 2:
+                    continue
+                b1, b2 = bids
+                if b1 in done or b2 in done or b1 == b2:
+                    continue
+                r1 = self.branches.loc[b1]
+                r2 = self.branches.loc[b2]
+                # lines only — a transformer carries a voltage ratio
+                if pd.notna(r1["voltage_ratio_pu"]) or pd.notna(r2["voltage_ratio_pu"]):
+                    continue
+                # orient so the chain reads up -> node -> down
+                if r1["to_bus_id"] == node and r2["from_bus_id"] == node:
+                    up, dn = b1, b2
+                elif r2["to_bus_id"] == node and r1["from_bus_id"] == node:
+                    up, dn = b2, b1
+                else:
+                    continue    # not a clean series pair
+
+                u, d = self.branches.at[up, "from_bus_id"], self.branches.at[dn, "to_bus_id"]
+                if u == d:
+                    continue
+
+                for col in ("r_ohm", "x_ohm", "r0_ohm", "x0_ohm"):
+                    if col in self.branches.columns:
+                        self.branches.at[up, col] = (
+                            self.branches.at[up, col] + self.branches.at[dn, col])
+                i1, i2 = self.branches.at[up, "i_max_a"], self.branches.at[dn, "i_max_a"]
+                self.branches.at[up, "i_max_a"] = np.nanmin([i1, i2])
+                self.branches.at[up, "to_bus_id"] = d
+
+                self.branches = self.branches.drop(index=dn)
+                done.update((up, dn))
+                merged_this_pass += 1
+
+            merged_total += merged_this_pass
+            if not merged_this_pass:
+                break
+
+        if merged_total:
+            gone = set(self.buses.index) - (
+                set(self.branches["from_bus_id"]) | set(self.branches["to_bus_id"]))
+            self.buses = self.buses.drop(index=[b for b in gone if b not in keep])
+            if not self.quiet:
+                logger.info("series reduction: %d -> %d branches (%d merged), "
+                            "%d buses remain", n_before, len(self.branches),
+                            merged_total, len(self.buses))
 
     def _apply_dtr_limits(self):
         # Dynamic thermal rating (Phase 1): replace each transformer's static
@@ -950,7 +1053,12 @@ class SoeSolver:
                 # not genuine infeasibility — and an adaptive barrier with
                 # relaxed bounds recovers most of them. Only failed intervals
                 # pay this cost.
-                if self.retry_on_failure:
+                # Do not retry a TIMEOUT with the same budget — it will simply
+                # time out again and double the cost of an interval that was
+                # never going to converge. Retry only failures that might be
+                # fixed by a different barrier configuration.
+                timed_out = "Maximum CPU Time" in verdict or "maxTimeLimit" in first
+                if self.retry_on_failure and not timed_out:
                     for k, v in _ROBUST_OPTIONS.items():
                         solver.options[k] = v
                     try:
@@ -979,6 +1087,34 @@ class SoeSolver:
                     self.last_solve_error = f"{type(e).__name__}: {e}"
                     logger.error("solver failed: %s", self.last_solve_error)
                     return pyomo.opt.SolverStatus.error
+
+        # A solver that STOPPED is not a solver that SOLVED. Hitting
+        # max_cpu_time or max_iter makes ipopt return termination
+        # 'maxIterations'/'maxTimeLimit' with status *warning*, and solve()
+        # accepts warning — so the current, non-converged iterate would be
+        # extracted and written out as a valid DOE with no indication that it
+        # is meaningless. That is worse than the failure it replaced, because
+        # it is silent. Treat any limit termination as a failure.
+        try:
+            tc = results.solver.termination_condition
+        except (AttributeError, KeyError, IndexError):
+            tc = None
+        _BAD_TC = {
+            pyomo.opt.TerminationCondition.maxIterations,
+            pyomo.opt.TerminationCondition.maxTimeLimit,
+            pyomo.opt.TerminationCondition.maxEvaluations,
+            pyomo.opt.TerminationCondition.userInterrupt,
+            pyomo.opt.TerminationCondition.infeasible,
+            pyomo.opt.TerminationCondition.unbounded,
+        }
+        if tc in _BAD_TC:
+            self.last_solve_error = (
+                f"solver stopped without converging: termination={tc}. "
+                f"Raise solver.max_cpu_time (currently "
+                f"{self.max_cpu_time:g}s) if this is a timeout on a large "
+                f"substation.")
+            logger.error("solver failed: %s", self.last_solve_error)
+            return pyomo.opt.SolverStatus.error
 
         self.last_solve_error = None
         return results['Solver'][0].status

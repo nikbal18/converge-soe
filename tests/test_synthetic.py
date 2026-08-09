@@ -443,6 +443,91 @@ def test_branches_oriented_away_from_source():
         assert len(s.branches) == len(s.buses) - 1
 
 
+def test_series_reduction_preserves_the_electrical_model():
+    """Merging line chains through empty nodes must change nothing that matters.
+
+    LV models carry far more nodes than customers — poles, joints, cable
+    changes. A node with two lines, no load and no transformer injects nothing,
+    so both branches carry the same current and collapse to one. The test is
+    that every load bus survives and the source-to-load impedance is unchanged.
+    """
+    from collections import defaultdict, deque
+    from fixtures import make_network
+    from converge_soe.doe_solver import SoeSolver
+
+    netw = make_network()
+    # splice 4 empty poles into the line feeding bus_a
+    line = netw["components"]["line_a"]["Line"]
+    src, dst = line["cons"][0]["node"], line["cons"][1]["node"]
+    z, z0 = list(line["z"]), list(line.get("z0", [0.0, 0.0]))
+    seg = [z[0] / 5.0, z[1] / 5.0]
+    seg0 = [z0[0] / 5.0, z0[1] / 5.0]
+    prev = src
+    for k in range(4):
+        nd = f"pole_{k}"
+        netw["components"][nd] = {"Node": {"v_base": 0.415,
+                                           "user_data": {"v_min": 0.373,
+                                                         "v_max": 0.457}}}
+        netw["components"][f"seg_{k}"] = {"Line": {
+            "cons": [{"node": prev}, {"node": nd}],
+            "length": 0.03, "z": list(seg), "z0": list(seg0),
+            # deliberately TIGHTER than line_a so the merge must take the min
+            "i_max": 250}}
+        prev = nd
+    line["cons"] = [{"node": prev}, {"node": dst}]
+    line["z"], line["z0"] = list(seg), list(seg0)
+
+    lids = [c for c, comp in netw["components"].items()
+            for t in comp if t == "Load"]
+    f = pd.DataFrame({"real_power_w": [5000.0] * len(lids),
+                      "reactive_power_var": [500.0] * len(lids)},
+                     index=pd.Index(lids, name="load_id"))
+
+    plain = SoeSolver(netw, f, quiet=True)
+    red = SoeSolver(netw, f, quiet=True, series_reduction=True)
+
+    assert len(red.branches) < len(plain.branches), "nothing was merged"
+    assert set(red.load_buses) == set(plain.load_buses)
+
+    root = [c["Infeeder"]["cons"][0]["node"]
+            for c in netw["components"].values() if "Infeeder" in c][0]
+
+    def path_z(s):
+        down = defaultdict(list)
+        for b, r in s.branches.iterrows():
+            down[r["from_bus_id"]].append((b, r["to_bus_id"]))
+        z, q = {root: (0.0, 0.0)}, deque([root])
+        while q:
+            n = q.popleft()
+            for b, m in down.get(n, []):
+                z[m] = (z[n][0] + s.branches.at[b, "r_pu"],
+                        z[n][1] + s.branches.at[b, "x_pu"])
+                q.append(m)
+        return z
+
+    za, zb = path_z(plain), path_z(red)
+    for bus in plain.load_buses:
+        assert bus in zb, f"load bus {bus} lost in reduction"
+        assert zb[bus][0] == pytest.approx(za[bus][0], abs=1e-12)
+        assert zb[bus][1] == pytest.approx(za[bus][1], abs=1e-12)
+
+    # the merged branch takes the TIGHTER current limit
+    assert red.branches["i_max_pu"].min() == pytest.approx(
+        plain.branches["i_max_pu"].min(), rel=1e-9)
+
+
+def test_series_reduction_is_off_by_default():
+    from fixtures import make_network
+    from converge_soe.doe_solver import SoeSolver
+    netw = make_network()
+    lids = [c for c, comp in netw["components"].items()
+            for t in comp if t == "Load"]
+    f = pd.DataFrame({"real_power_w": [1000.0] * len(lids),
+                      "reactive_power_var": [100.0] * len(lids)},
+                     index=pd.Index(lids, name="load_id"))
+    assert SoeSolver(netw, f, quiet=True).series_reduction is False
+
+
 def test_findings_report_the_share():
     sub = _network(n_with_data=8, n_gaps=3)
     _, rep = sy.synthesise_substation(sub, _bundle(8), sy.config({}), "S1",

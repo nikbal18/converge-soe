@@ -69,7 +69,8 @@ class PersistentDoeSolver:
                  k_emergency=2.0, k2_floor=1e-6,
                  soft_limits=True, soft_limit_penalty=1000.0,
                  quiet=True, solver_name="ipopt", use_appsi=None,
-                 thermal_state_in=None, usable_export_weight=0.0):
+                 thermal_state_in=None, usable_export_weight=0.0,
+                 series_reduction=False):
         if tx_limit not in ("dtr", "static"):
             raise ValueError("PersistentDoeSolver supports tx_limit dtr|static; "
                              "'legacy' lives on the plain path")
@@ -115,6 +116,7 @@ class PersistentDoeSolver:
         base._network_cache_in = None
         base.solver_name = solver_name
         base.solver_options = {}
+        base.series_reduction = bool(series_reduction)
         base._filter_input_data()
         base._build_network_data()
         self.net = base   # buses / branches / loads / transformers / partic ids

@@ -116,6 +116,7 @@ def run_doe_scenario(scenario, sub_ej, bundle, transformer_params, cfg,
         solver_opts.setdefault("linear_solver", cfg["solver"]["linear_solver"])
     max_cpu = float(cfg.get("solver", {}).get("max_cpu_time", 120.0))
     retry = bool(cfg.get("solver", {}).get("retry_on_failure", True))
+    series_red = bool((cfg.get("network", {}) or {}).get("series_reduction", False))
 
     if fast:
         from .persistent_solver import PersistentDoeSolver
@@ -126,7 +127,7 @@ def run_doe_scenario(scenario, sub_ej, bundle, transformer_params, cfg,
             k_emergency=k_emergency, k2_floor=k2_floor,
             soft_limits=soft, soft_limit_penalty=soft_pen,
             quiet=True, solver_name=solver_name, thermal_state_in=state,
-            usable_export_weight=use_w)
+            usable_export_weight=use_w, series_reduction=series_red)
 
     net_cache = None
     warm = None
@@ -164,7 +165,8 @@ def run_doe_scenario(scenario, sub_ej, bundle, transformer_params, cfg,
                           warm_start_in=warm, network_cache=net_cache,
                           solver_options=solver_opts, solver_name=solver_name,
                           usable_export_weight=use_w,
-                          max_cpu_time=max_cpu, retry_on_failure=retry)
+                          max_cpu_time=max_cpu, retry_on_failure=retry,
+                          series_reduction=series_red)
             if net_cache is None:
                 net_cache = s.network_cache()
             status, res = s.solve()
