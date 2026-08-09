@@ -52,6 +52,18 @@ def parse_args():
                          "(single-scenario debugging)")
     ap.add_argument("--values-are", default=None,
                     choices=["w", "kw", "kwh_per_interval"])
+    ap.add_argument("--series-reduction", action="store_true",
+                    help="merge chains of lines through nodes carrying no "
+                         "load, transformer or setpoint. EXACT (with no "
+                         "injection the voltage along the chain is monotonic, "
+                         "so the extreme is at an endpoint), 39-53%% fewer "
+                         "branches, and the NLP scales superlinearly. Makes "
+                         "runs non-comparable with unreduced ones — use it "
+                         "for a whole study or not at all")
+    ap.add_argument("--dry-run-steps", type=int, default=20,
+                    help="intervals in the --dry-run pilot (default 20). "
+                         "Lower it when you are screening many substations "
+                         "and only need the order of magnitude")
     ap.add_argument("--fixed-lv-taps", action="store_true",
                     help="pin every LV transformer to nominal tap. The XML "
                          "carries no tap data, so the converted values are "
@@ -99,6 +111,14 @@ def parse_args():
                          "Not physical — no meter means no DOE — but it shows "
                          "the upper bound on what DOEs could do for the "
                          "transformer if every customer were dispatchable")
+    ap.add_argument("--feeder-donor-bank", action="store_true",
+                    help="draw synthetic-profile donors from the sibling "
+                         ".npz bundles of the whole feeder, not just the "
+                         "substations named in --only. Without it, a "
+                         "one-substation --only run has a one-substation "
+                         "donor pool, which is not what allow_feeder_donors "
+                         "means. Requires one prior whole-feeder pass to "
+                         "have written the bundles")
     ap.add_argument("--no-synthetic", action="store_true",
                     help="do not synthesise profiles for NMIs without meter "
                          "data; they contribute nothing to the power flow "
@@ -145,12 +165,16 @@ def main():
         overrides["tx_limit"] = args.tx_limit
     if args.fixed_lv_taps:
         overrides.setdefault("network", {})["fixed_lv_taps"] = True
+    if args.series_reduction:
+        overrides.setdefault("network", {})["series_reduction"] = True
     if args.infeeder_kv is not None:
         overrides.setdefault("network", {})["infeeder_v_setpoint_kv"] = args.infeeder_kv
     if args.transformer_derate is not None:
         overrides.setdefault("network", {})["transformer_derate"] = args.transformer_derate
     if args.synthetic_participate:
         overrides.setdefault("synthetic", {})["participants"] = True
+    if args.feeder_donor_bank:
+        overrides.setdefault("synthetic", {})["feeder_donor_bank"] = True
     if any(v is not None for v in (args.scale_load, args.scale_import,
                                    args.scale_export)):
         base = args.scale_load if args.scale_load is not None else 1.0
@@ -293,14 +317,26 @@ def main():
     if args.dry_run:
         n_steps = next(iter(bundles.values()))["P"].shape[0] if bundles else 0
         n_runs = len(bundles) * len(scenarios)
-        # pilot estimate: 20 timesteps of the first substation
+        # pilot estimate: --dry-run-steps timesteps of the first substation
         est = "unknown"
+        n_pilot = max(1, args.dry_run_steps)
         if bundles:
             import time as _t
             from converge_soe import io as cio
             import tempfile
             safe0 = next(iter(bundles))
-            b0 = {k: (v[:20] if getattr(v, "ndim", 0) >= 1 and len(v) >= 20 else v)
+            # Slice the TIME axis only. `v[:20] if len(v) >= 20` also chopped
+            # load_ids and synthetic, which are indexed by NMI, not by
+            # timestep: on a 36-NMI substation P kept 36 columns while the
+            # bounds derived from load_ids had 20, and run_doe_scenario died
+            # in np.clip with "operands could not be broadcast together with
+            # shapes (36,) (20,) (20,)". Anything with 20 or fewer NMIs got
+            # away with it, which is why small test substations never showed
+            # it. Keying on "first axis is the time axis" is the fix.
+            _T = bundles[safe0]["P"].shape[0]
+            _n = min(n_pilot, _T)
+            b0 = {k: (v[:_n] if getattr(v, "ndim", 0) >= 1
+                      and getattr(v, "shape", (None,))[0] == _T else v)
                   for k, v in bundles[safe0].items()}
             with tempfile.TemporaryDirectory() as td:
                 w = cio.SubstationWriter(td, safe0, "doe_dtr")
@@ -310,7 +346,7 @@ def main():
                                      tparams_by_sub[safe0], cfg, w,
                                      fast=cfg.get("solver", {}).get("fast", False))
                 w.close()
-                per = (_t.perf_counter() - t0) / 20
+                per = (_t.perf_counter() - t0) / _n
             est = f"{per * n_steps * n_runs / max(cfg.get('jobs') if isinstance(cfg.get('jobs'), int) else 4, 1) / 60:.1f} min (~{per*1000:.0f} ms/step)"
         print(f"DRY RUN: {len(bundles)} substation(s) × {len(scenarios)} "
               f"scenario(s) × {n_steps} timesteps; estimated {est}")
