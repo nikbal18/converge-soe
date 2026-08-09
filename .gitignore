@@ -64,3 +64,18 @@ archive/
 # (both the pre-reorg and post-reorg locations)
 examples/RUN_DOE_GUIDE.md
 examples/legacy/RUN_DOE_GUIDE.md
+
+# Orchestration and reporting that name real feeders and substations. Same
+# reasoning as RUN_DOE_GUIDE.md above: the generic library code is public,
+# anything carrying the DNSP's network identifiers is not.
+scripts/run_all_feeders.py
+docs/RUN_ALL_FEEDERS.md
+tools/make_paper_figures.py
+tools/plot_utilisation_vs_benefit.py
+run_*.sh
+run_*.log
+COMMIT_PLAN.md
+
+# Paper figures and tables. Labelled with real feeder names and derived from
+# the confidential runs; the manuscript itself lives outside this repo.
+paper/
