@@ -23,6 +23,8 @@ import csv
 import json
 import logging
 import os
+import shutil
+import time
 from pathlib import Path
 
 import pyarrow as pa
@@ -32,6 +34,43 @@ logger = logging.getLogger(__name__)
 
 CHECKPOINT_SCHEMA_VERSION = 1
 TABLE_NAMES = ("doe", "bus", "branch", "viol", "thermal")
+
+
+def atomic_replace(tmp, dest, attempts=12, delay=0.2):
+    """``os.replace`` that survives a cloud-sync client holding the file open.
+
+    On Windows the replace fails with PermissionError (WinError 5 or 32) for
+    as long as ANY other process has a handle on the destination. OneDrive
+    opens files to upload them moments after they appear; Defender's real-time
+    scanner and the search indexer do the same. This repo lives in a
+    OneDrive-synced folder and an overnight run rewrites the same handful of
+    small JSON files thousands of times, so a "rare" race becomes several a
+    night — and one of them killed the 17:18 planning run outright.
+
+    Retries with backoff (~10 s in total), then falls back to a non-atomic
+    copy. A torn status file is recoverable; losing the night is not.
+    """
+    tmp, dest = str(tmp), str(dest)
+    last = None
+    for i in range(attempts):
+        try:
+            os.replace(tmp, dest)
+            return
+        except PermissionError as e:      # WinError 5 / 32
+            last = e
+            time.sleep(delay * (1.5 ** i))
+        except OSError as e:
+            last = e
+            break
+    logger.warning("atomic replace of %s blocked after %d attempts (%s) — "
+                   "falling back to a non-atomic copy. Something is holding "
+                   "the file open; pause OneDrive syncing.", dest, attempts,
+                   type(last).__name__)
+    try:
+        shutil.copyfile(tmp, dest)
+        os.unlink(tmp)
+    except OSError:
+        raise last
 
 
 class _StreamingTable:
@@ -185,7 +224,7 @@ class SubstationWriter:
         }
         tmp = self.outdir / "_checkpoint.json.tmp"
         tmp.write_text(json.dumps(ck, indent=1, default=str), encoding="utf-8")
-        os.replace(tmp, self.outdir / "_checkpoint.json")
+        atomic_replace(tmp, self.outdir / "_checkpoint.json")
 
     def close(self):
         self.flush()
@@ -236,17 +275,31 @@ def resume_state(outdir, inputs_fingerprint, restart=False):
 
 
 def fresh_output_dir(outdir):
-    """Delete a substation's partial outputs before a restart."""
+    """Delete a substation's partial outputs before a restart.
+
+    Tolerant of files that will not unlink. On Windows a file held open by
+    any process — this one's own log handler, OneDrive uploading it, the
+    virus scanner reading it — raises PermissionError, and taking down the
+    restart because a LOG file could not be deleted loses the whole task.
+    The data files are what matter; anything left behind is reported.
+    """
     outdir = Path(outdir)
-    for n in TABLE_NAMES:
-        for suffix in (".parquet", ".csv"):
-            p = outdir / f"{n}{suffix}"
-            if p.exists():
-                p.unlink()
-    for name in ("_checkpoint.json", "failures.csv", "run.log"):
-        p = outdir / name
-        if p.exists():
+    stuck = []
+    targets = [outdir / f"{n}{s}" for n in TABLE_NAMES
+               for s in (".parquet", ".csv")]
+    targets += [outdir / n for n in ("_checkpoint.json", "failures.csv",
+                                     "run.log")]
+    for p in targets:
+        if not p.exists():
+            continue
+        try:
             p.unlink()
+        except PermissionError:
+            stuck.append(p.name)
+    if stuck:
+        logger.warning("restart: could not delete %s in %s (held open by "
+                       "another process) — continuing", ", ".join(stuck),
+                       outdir)
 
 
 # ---------------------------------------------------------------------------
@@ -258,16 +311,27 @@ def update_run_manifest(run_dir, substation, scenario, status, **extra):
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     p = run_dir / "_manifest.json"
+    # The WRITE was hardened with atomic_replace; the READ was not, and with
+    # several substations of one feeder solving at once (--no-feeder-lock)
+    # they collide on this one small file. On Windows that read raises
+    # PermissionError, which propagated out of _report_result and killed the
+    # whole run_feeder process — losing a solved substation to a status file.
     manifest = {}
-    if p.exists():
+    for attempt in range(8):
+        if not p.exists():
+            break
         try:
             manifest = json.loads(p.read_text())
+            break
         except json.JSONDecodeError:
             manifest = {}
+            break
+        except OSError:
+            time.sleep(0.2 * (1.5 ** attempt))
     manifest.setdefault(scenario, {})[substation] = {"status": status, **extra}
-    tmp = run_dir / "_manifest.json.tmp"
+    tmp = run_dir / f"_manifest.json.{os.getpid()}.tmp"
     tmp.write_text(json.dumps(manifest, indent=1, default=str), encoding="utf-8")
-    os.replace(tmp, p)
+    atomic_replace(tmp, p)
     return manifest
 
 

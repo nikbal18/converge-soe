@@ -90,9 +90,9 @@ def update_manifest(repo, key, fingerprint):
     p.parent.mkdir(parents=True, exist_ok=True)
     m = read_manifest(repo)
     m[key] = {"fingerprint": fingerprint, "updated": datetime.now().isoformat()}
-    tmp = p.with_suffix(".json.tmp")
+    tmp = p.with_suffix(f".json.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(m, indent=1), encoding="utf-8")
-    os.replace(tmp, p)
+    cio.atomic_replace(tmp, p)
 
 
 def cache_fresh(repo, key, fingerprint, *outputs):
@@ -418,7 +418,14 @@ def stage_select_feeder(feeder_ej, df_long, repo=REPO, feeder_name="FEEDER",
     nmi_index = pd.DataFrame(index_rows)
     out = Path(repo) / "build" / "feeders" / feeder_name / "nmi_index.csv"
     out.parent.mkdir(parents=True, exist_ok=True)
-    nmi_index.to_csv(out, index=False)
+    # Written via a unique temp + os.replace so that two run_feeder processes
+    # working on the SAME feeder (different --only substations, which is how
+    # scripts/run_all_feeders.py parallelises) cannot interleave their writes
+    # and leave a half-and-half file. os.replace is atomic on Windows and
+    # POSIX alike; last writer wins, and every writer's content is complete.
+    tmp = out.with_suffix(f".csv.{os.getpid()}.tmp")
+    nmi_index.to_csv(tmp, index=False)
+    cio.atomic_replace(tmp, out)
 
     empty = [s for s in substations
              if not (nmi_index["substation"] == s).any()]
@@ -483,7 +490,34 @@ def stage_synthesise(substations, bundles, cfg, run_dir=None, repo=REPO,
         log(f"stage ⑤b synthesise: {len(skipped)} substation(s) have no metered "
             f"NMIs and are skipped entirely: {', '.join(sorted(skipped))}")
 
-    bundles, reports = syn.synthesise_all(substations, bundles, cfg, log=log)
+    # Sibling bundles as donors-only. See synthetic._donor_bank: with --only,
+    # `bundles` holds one substation, so the "feeder-wide" donor pool is not
+    # feeder-wide at all. Off by default so existing runs and their resume
+    # fingerprints are untouched; scripts/run_all_feeders.py turns it on
+    # (run_feeder --feeder-donor-bank) because it solves one substation per
+    # invocation and would otherwise get a materially different donor pool
+    # from a whole-feeder run.
+    extra_bundles = None
+    if (cfg.get("synthetic", {}) or {}).get("feeder_donor_bank"):
+        sib_dir = (Path(repo) / "build" / "timeseries" / "by_substation"
+                   / feeder_name)
+        extra_bundles = {}
+        for p in sorted(sib_dir.glob("*.npz")) if sib_dir.exists() else []:
+            if p.stem in bundles:
+                continue
+            try:
+                extra_bundles[p.stem] = tsm.load_npz(p)
+            except Exception as e:
+                log(f"stage ⑤b synthesise: could not read sibling bundle "
+                    f"{p.name} ({type(e).__name__}) — ignored")
+        if not extra_bundles:
+            log("stage ⑤b synthesise: feeder_donor_bank is on but no sibling "
+                "bundles exist yet — run the feeder once without --only "
+                "first, or the pool is just this substation")
+            extra_bundles = None
+
+    bundles, reports = syn.synthesise_all(substations, bundles, cfg, log=log,
+                                          extra_bundles=extra_bundles)
 
     for safe, bundle in bundles.items():
         if not np.asarray(bundle.get("synthetic", False)).any():
@@ -555,6 +589,16 @@ def _solve_one(args):
 
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
+
+    # BEFORE the FileHandler opens run.log. fresh_output_dir deletes run.log,
+    # and Windows refuses to unlink a file the calling process holds open —
+    # so --restart died with "WinError 32: the process cannot access the file
+    # because it is being used by another process", pointing at a log file it
+    # had itself just opened. On POSIX unlinking an open file is legal, which
+    # is why this only ever appeared on the laptop.
+    if restart:
+        cio.fresh_output_dir(outdir)
+
     lg = logging.getLogger(f"csoe.{scenario}.{safe}")
     fh = logging.FileHandler(outdir / "run.log")
     fh.setLevel(logging.DEBUG if verbosity >= 2 else logging.INFO)
@@ -563,8 +607,6 @@ def _solve_one(args):
     bundle = tsm.load_npz(bundle_path)
     t0 = time.perf_counter()
     try:
-        if restart:
-            cio.fresh_output_dir(outdir)
         start_after, state, n_done, n_fail = (None, {}, 0, 0)
         if resume and not restart:
             start_after, state, n_done, n_fail = cio.resume_state(
@@ -579,6 +621,32 @@ def _solve_one(args):
         writer.last_completed_timestamp = start_after
 
         if scenario == "bau":
+            # BAU evaluates the WHOLE period in one vectorised sweep — it has
+            # no per-interval loop and therefore no resume point. If a
+            # checkpoint exists it is already complete, so re-running would
+            # append a second copy of every row: a resumed run produced 288
+            # rows for a 144-interval bundle, silently doubling the BAU
+            # baseline that every other scenario is compared against.
+            n_steps = int(bundle["P"].shape[0])
+            if start_after is not None and n_done >= n_steps:
+                writer.close()
+                lg.info("bau already complete (%d/%d intervals) — skipping",
+                        n_done, n_steps)
+                return {"scenario": scenario, "substation": safe,
+                        "status": "ok", "n_completed": n_done,
+                        "n_failed": n_fail, "seconds": 0.0,
+                        "pyomo_warnings": {}}
+            if start_after is not None:
+                # partial BAU output cannot be extended — start it over
+                writer.close()
+                cio.fresh_output_dir(outdir)
+                writer = cio.SubstationWriter(
+                    outdir, safe, scenario, inputs_fingerprint=fingerprint,
+                    code_version=code_version,
+                    flush_every=cfg.get("flush_every", 200),
+                    csv_mirror=cfg.get("csv_mirror", False))
+                lg.warning("bau output was partial (%d/%d) — restarted",
+                           n_done, n_steps)
             scen.run_bau_scenario(sub_ej, bundle, tparams, cfg, writer)
         else:
             scen.run_doe_scenario(scenario, sub_ej, bundle, tparams, cfg,
@@ -670,10 +738,18 @@ def stage_solve(substations, bundles, tparams_by_sub, cfg, run_dir,
 
 
 def _report_result(r, run_dir, bar, verbosity, log):
-    cio.update_run_manifest(run_dir, r["substation"], r["scenario"],
-                            r["status"], **{k: v for k, v in r.items()
-                                            if k not in ("substation",
-                                                         "scenario", "status")})
+    # The manifest is bookkeeping. Never let a failure to write it discard a
+    # substation that actually solved — on 9 Aug a PermissionError here took
+    # down six run_feeder processes that had done their work.
+    try:
+        cio.update_run_manifest(run_dir, r["substation"], r["scenario"],
+                                r["status"], **{k: v for k, v in r.items()
+                                                if k not in ("substation",
+                                                             "scenario",
+                                                             "status")})
+    except Exception as e:
+        log(f"  ! could not update _manifest.json ({type(e).__name__}: {e}) — "
+            f"the results themselves are unaffected")
     if bar is not None:
         bar.update(1)
     if r["status"] != "ok":
