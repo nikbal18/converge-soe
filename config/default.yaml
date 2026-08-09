@@ -45,6 +45,27 @@ tx_limit: dtr                 # dtr | static | legacy — transformer current li
 # export has no RatioTapChanger; this override does the same for networks that
 # were built before that change, so old build/ artefacts stay correct.
 network:
+  series_reduction: false     # merge chains of lines through nodes that carry
+                              # no load, no transformer and no setpoint. Such a
+                              # node injects nothing, so both branches carry the
+                              # same current and collapse to one with
+                              # r = r1+r2, x = x1+x2, i_max = min(i1, i2).
+                              # EXACT, not an approximation: with no injection
+                              # the voltage along the chain is monotonic, so the
+                              # extreme is at an endpoint. Verified on the real
+                              # networks — every load bus is retained and the
+                              # source-to-load impedance is unchanged to 1e-16.
+                              #
+                              # LV models carry far more nodes than customers
+                              # (poles, joints, cable changes): S_11038 has 950
+                              # branches for 148 customers. Reduction gives
+                              # 39-53% fewer branches, and the NLP scales
+                              # superlinearly.
+                              #
+                              # OFF by default so that turning it on is always a
+                              # deliberate, recorded choice — mixing reduced and
+                              # unreduced runs in one study would not be
+                              # comparable.
   fixed_lv_taps: true
   infeeder_v_setpoint_kv: null   # null = use the converted value (11.55 kV =
                                  # 1.05 pu). The turns ratio maps 11 kV to
@@ -103,6 +124,26 @@ synthetic:
                               # over-weighting repeat picks
   include_placeholder_loads: false   # cim_to_json LV dead-end stubs are
                                      # topology, not customers
+  feeder_donor_bank: false    # widen the pool of allow_feeder_donors to the
+                              # sibling .npz bundles on disk, i.e. to the
+                              # substations NOT named in --only.
+                              #
+                              # Without it, allow_feeder_donors is only as
+                              # wide as `bundles`, and --only puts one
+                              # substation in bundles — so a single-substation
+                              # run draws from that substation's own meters
+                              # rather than the feeder's several hundred. On a
+                              # thinly-metered substation that falls below
+                              # min_donors and drops into the disaggregation
+                              # fallback, which is not what the setting below
+                              # says it does.
+                              #
+                              # OFF by default because turning it on changes
+                              # the synthetic profiles, and therefore the
+                              # bundle fingerprint, so existing runs would
+                              # refuse to --resume. CLI: --feeder-donor-bank.
+                              # Needs one prior whole-feeder pass to have
+                              # written the sibling bundles.
   allow_feeder_donors: true   # draw from every metered NMI on the feeder, not
                               # just this substation. Consumption does not vary
                               # much geographically within a feeder, so a donor
@@ -137,11 +178,17 @@ solver:
   fast: false                 # true = persistent mutable-Param model (--fast);
                               # validated against the plain path by
                               # tests/test_fast_path_equivalence.py
-  max_cpu_time: 120           # s — wall-clock cap per solve. Without one, a
+  max_cpu_time: 600           # s — wall-clock cap per solve. Without one, a
                               # single pathological interval ran 5189 s and
                               # held the whole run hostage. Losing that
                               # interval costs one row; losing the afternoon
                               # costs the run.
+                              # Size it to the SUBSTATION: 120 s was ample at
+                              # 28-96 NMIs but too tight for the larger
+                              # 90-148 NMI substations, where it cut off
+                              # solves that were still converging.
+                              # Hitting the cap is now a recorded FAILURE, not
+                              # a silently-accepted non-converged answer.
   retry_on_failure: true      # on a failed solve, retry that interval once
                               # with an adaptive barrier and relaxed bounds.
                               # Most failures are "Error in step computation"

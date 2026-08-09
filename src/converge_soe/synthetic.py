@@ -435,34 +435,77 @@ def _fallback(gaps, P, mask, index, dt_min, window, scfg, substation, rng):
 # ---------------------------------------------------------------------------
 # All substations
 # ---------------------------------------------------------------------------
-def _donor_bank(bundles):
-    """(ids, P, Q) of every complete, real profile across the whole feeder."""
-    ids, cols_p, cols_q = [], [], []
+def _donor_bank(bundles, extra_bundles=None, log=logger.info):
+    """(ids, P, Q) of every complete, real profile across the whole feeder.
+
+    ``extra_bundles`` are pre-indexed bundles for substations that are NOT
+    being solved in this invocation — the sibling ``.npz`` files left by an
+    earlier whole-feeder pass. They contribute donors only.
+
+    Why they matter: ``allow_feeder_donors`` is meant to draw on every metered
+    NMI on the feeder. But the pool is built from ``bundles``, and
+    ``run_feeder --only "<one substation>"`` puts exactly one substation in
+    ``bundles``. The pool silently collapses to that substation's own meters —
+    on a thinly-metered substation, a handful — which is below ``min_donors``
+    and drops through to the transformer-disaggregation fallback. Measured on
+    one feeder: 230 donors whole-feeder against 5 under ``--only``, with the
+    single-substation run flagged for donor reuse. So a per-substation run
+    does NOT reproduce a whole-feeder run unless the siblings are supplied.
+
+    Columns whose length does not match are skipped rather than crashing
+    ``np.stack``: pre_index builds each substation's time grid from its own
+    NMIs' coverage, so two substations on one feeder can legitimately differ.
+    """
+    ids, cols_p, cols_q, seen = [], [], [], set()
+    n_steps = None
     for b in bundles.values():
+        if b.get("P") is not None and getattr(b["P"], "size", 0):
+            n_steps = b["P"].shape[0]
+            break
+
+    n_extra, n_wrong_length = 0, 0
+    sources = list(bundles.values()) + list((extra_bundles or {}).values())
+    n_own = len(bundles)
+    for i, b in enumerate(sources):
         mask = b["mask"]
         if not mask.size:
+            continue
+        if n_steps is not None and b["P"].shape[0] != n_steps:
+            n_wrong_length += 1
             continue
         syn = np.asarray(b.get("synthetic", np.zeros(mask.shape[1], bool)), bool)
         complete = mask.all(axis=0)
         for j, lid in enumerate(map(str, b["load_ids"])):
-            if complete[j] and not syn[j] and lid not in set(ids):
+            if complete[j] and not syn[j] and lid not in seen:
+                seen.add(lid)
                 ids.append(lid)
                 cols_p.append(b["P"][:, j])
                 cols_q.append(b["Q"][:, j])
+                if i >= n_own:
+                    n_extra += 1
+    if extra_bundles:
+        log(f"stage ⑤b synthesise: donor pool {len(ids)} profile(s) "
+            f"({len(ids) - n_extra} from the substation(s) being solved, "
+            f"{n_extra} from {len(extra_bundles)} sibling bundle(s) on the "
+            f"same feeder)")
+    if n_wrong_length:
+        log(f"stage ⑤b synthesise: skipped {n_wrong_length} bundle(s) whose "
+            f"time grid does not match this run")
     if not ids:
         return None
     return ids, np.stack(cols_p, axis=1), np.stack(cols_q, axis=1)
 
 
-def synthesise_all(substations, bundles, cfg, log=logger.info):
+def synthesise_all(substations, bundles, cfg, log=logger.info,
+                   extra_bundles=None):
     """Fill gaps in every substation bundle. Returns (bundles, reports)."""
     scfg = config(cfg)
     if not scfg.get("enabled", True):
         log("stage ⑤b synthesise: disabled by config")
         return bundles, []
 
-    feeder_donors = _donor_bank(bundles) if scfg.get("allow_feeder_donors") \
-        else None
+    feeder_donors = (_donor_bank(bundles, extra_bundles, log=log)
+                     if scfg.get("allow_feeder_donors") else None)
 
     out, reports = {}, []
     for safe, bundle in bundles.items():
