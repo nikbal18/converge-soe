@@ -1,0 +1,74 @@
+# Cost model parameters. Every value here is written into
+# out/stage4/cost_model_detail.csv, so provenance stays traceable.
+
+# ---------------------------------------------------------------- SOURCED
+# AER Final Decision - Overview - Evoenergy - 2024-29 Distribution revenue
+# proposal - April 2024, Table 1: "Nominal vanilla WACC 5.85%".
+# Applies to the FIRST year of the period; the return on debt component is
+# updated annually against a 10-year trailing average. State which year you use.
+wacc_nominal_vanilla: 0.0585
+
+# ---------------------------------------------------------------- PLACEHOLDER
+# NOT SOURCED. The AER repex model does not publish a standard asset life for
+# distribution transformers - it calibrates average replacement age per
+# distributor from observed practice. Replace from Evoenergy Appendix 1.9
+# (CutlerMerz repex results) or the Evoenergy RIN age profile.
+# Note there are two different lives: the REGULATORY depreciation life (drives
+# the RAB, used in the tariff step) and the PHYSICAL replacement age (what this
+# annuity needs). This parameter is the physical one.
+standard_asset_life_years: 50
+
+# ---------------------------------------------------------------- ESTIMATE
+# THE ONE NUMBER TO CHANGE. Installed replacement cost of one distribution
+# transformer, AUD. Working estimate, not sourced. When set, the per-kVA table
+# below is ignored entirely.
+unit_replacement_cost_flat_aud: 100000
+
+# Optional per-kVA bands, used ONLY if the flat cost above is null.
+unit_replacement_cost_aud:
+  250: null
+  315: null
+  500: null
+  750: null
+  1000: null
+
+# ---------------------------------------------------------------- STANDARD
+# Normal insulation life, hours, at the 110 C reference hot-spot, CONTINUOUS.
+# IEEE C57.91 Table 2 - NOT AS/NZS 60076.7, which uses a DP-based approach and
+# does not publish this figure (the Evoenergy/Gridsight report says so directly).
+#     65,000 h  - 50 % retained tensile strength
+#    135,000 h  - 25 % retained tensile strength
+#    145,000 h  - 200 retained degree of polymerisation
+#    180,000 h  - interpretation of distribution transformer functional life
+#                 test data                                   <- default below
+# None of these embeds a duty cycle: part-load operation is already captured by
+# F_AA falling below 1 whenever the hot-spot is under 110 C. Do not double-count.
+# This constant decides whether ageing pulls replacement inside the standard
+# asset life at all, so it is swept below.
+normal_insulation_life_hours: 180000.0
+
+# How the DNSP's ageing cost is valued. Two valuations of the SAME wear -
+# report one as headline, the other as a bound, never add them.
+#   depletion - life consumed x (unit cost / normal insulation life). Always
+#               non-zero. Ignores when the life is consumed.
+#   deferral  - change in NPV of the replacement stream. Zero unless ageing
+#               actually moves the replacement date.
+# Both are always computed and printed; this only picks which drives net value.
+network_cost_basis: depletion
+
+# End of life as a percentage of the above.
+end_of_life_percent_lol: 100.0
+
+# Cumulative loss of life already consumed at the start, per cent.
+# 0 until Evoenergy condition assessment data is joined.
+starting_loss_of_life_percent: 0.0
+
+# Value of the energy the DTR passes that a nameplate-limited DOE would not.
+# The same price the DOE runs assumed. An assumption, not a result.
+energy_value_per_kwh: 0.10
+
+sensitivity:
+  starting_lol_percent: [0.0, 30.0, 60.0]
+  wacc_absolute_delta: [-0.01, 0.0, 0.01]
+  unit_cost_multiplier: [0.5, 1.0, 2.0]
+  normal_insulation_life_hours: [65000.0, 135000.0, 180000.0]
