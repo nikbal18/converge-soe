@@ -53,6 +53,19 @@ DEFAULT_BASELINE = {"lexcen": "lexcen7_summer"}   # everything else: peak7_summe
 THERMAL_BOUND_PCT = 95.0   # peak utilisation at or above this = the DTR cap is binding
 MAX_SYNTHETIC_PCT = 90.0   # above this the substation has no customers to control
 
+# Peak utilisation above this means the SOLVED current exceeded the DTR cap.
+# The soft current limit (solver.soft_limits, penalty 1000) permits that at a
+# price, so the optimiser buys its way through the thermal constraint instead of
+# respecting it. The substation is then measuring the penalty, not the network:
+# its ageing and recovered-export numbers are not physical. This is the same
+# pattern that makes Wellington-Gurrang unusable (290.8 % utilisation, 167.7 C).
+#
+# It does NOT invalidate the crossover. Utilisation past 100 % means the thermal
+# cap started binding somewhere BELOW this rung, which is exactly what the
+# crossover measures. So these substations stay in the crossover and are held
+# out of the benefit and ageing totals.
+SOFT_LIMIT_PCT = 105.0
+
 # Keys that must be identical across every rung. Anything not listed is either
 # a scaling key (the point of the exercise) or a scheduling key that cannot
 # change a result: jobs, flush_every, resume, csv_mirror.
@@ -184,6 +197,9 @@ def collect_run(run_dir, level):
             if c_static and c_static == c_static and c_static > 0 else float("nan"),
             n_loads=n_loads, n_metered=n_metered, pct_synthetic=pct_syn,
         ))
+    for r in rows:
+        u = r.get("util_max_pct")
+        r["soft_limit_absorbed"] = bool(u == u and u is not None and u > SOFT_LIMIT_PCT)
     return pd.DataFrame(rows)
 
 
@@ -438,8 +454,11 @@ def run_one(args, feeder):
     srows = []
     for level, g in df.groupby("level"):
         bound = g["util_max_pct"] >= args.threshold
-        age_bau = g["ageing_h_bau"].sum()
-        curt_s = g["curt_static_kwh"].sum()
+        # Benefit and ageing totals use only the substations whose solution
+        # actually respected the thermal cap. Crossover stats use all of them.
+        phys = g[~g["soft_limit_absorbed"]]
+        age_bau = phys["ageing_h_bau"].sum()
+        curt_s = phys["curt_static_kwh"].sum()
         srows.append({
             "level": level,
             "n_substations": len(g),
@@ -448,18 +467,35 @@ def run_one(args, feeder):
             "median_util_max_pct": g["util_max_pct"].median(),
             "max_util_max_pct": g["util_max_pct"].max(),
             # weighted by ageing, because that is the claim the cost chapter makes
+            "n_soft_limit_absorbed": int(g["soft_limit_absorbed"].sum()),
             "share_of_bau_ageing_at_bound_pct":
-                100 * g.loc[bound, "ageing_h_bau"].sum() / age_bau
+                100 * phys.loc[bound.reindex(phys.index, fill_value=False),
+                               "ageing_h_bau"].sum() / age_bau
                 if age_bau else float("nan"),
             "total_curt_static_kwh": curt_s,
-            "total_recovered_kwh": g["recovered_kwh"].sum(),
+            "total_recovered_kwh": phys["recovered_kwh"].sum(),
             "recovery_frac_pct":
-                100 * g["recovered_kwh"].sum() / curt_s if curt_s else float("nan"),
+                100 * phys["recovered_kwh"].sum() / curt_s if curt_s else float("nan"),
             "total_ageing_h_bau": age_bau,
-            "total_ageing_h_static": g["ageing_h_static"].sum(),
-            "total_ageing_h_dtr": g["ageing_h_dtr"].sum(),
+            "total_ageing_h_static": phys["ageing_h_static"].sum(),
+            "total_ageing_h_dtr": phys["ageing_h_dtr"].sum(),
         })
     summary = pd.DataFrame(srows).sort_values("level").reset_index(drop=True)
+
+    sla = df[df["soft_limit_absorbed"]]
+    if len(sla):
+        print(f"\n!!! SOFT LIMIT ABSORBED THE OVERLOAD at {sla['substation'].nunique()} "
+              f"substation(s) on {sla['level'].nunique()} rung(s)")
+        for _, r in sla.sort_values(["level", "util_max_pct"], ascending=[True, False]).iterrows():
+            print(f"      {r['level']:>4g}x  {r['substation']:12s} "
+                  f"peak utilisation {r['util_max_pct']:6.0f}%  "
+                  f"peak hot-spot {r['peak_thetaHS_dtr']:6.1f} C")
+        print("    The solved current exceeded the DTR cap and the soft current limit")
+        print("    permitted it at a penalty, so these solutions are not physical.")
+        print("    They are HELD OUT of the benefit and ageing totals and KEPT in the")
+        print("    crossover, where passing 100% is the thing being measured.")
+        print("    If this grows with the rungs, the ladder has a validity ceiling and")
+        print("    the top rungs describe the penalty rather than the network.")
 
     cross = crossover(df, args.threshold)
 

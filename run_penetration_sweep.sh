@@ -71,6 +71,47 @@ LEVELS="${LEVELS:-1.5 2.0 3.0}"
 # ageing-dominant substations are donor-sampled.
 FEEDERS="${FEEDERS:-lexcen,saunders,birrigai}"
 
+# RETRY=1 adds --retry-failed, which re-queues tasks left as ERROR, RUNNING or
+# STALE_CHECKPOINT by a previous attempt. You need it after a Ctrl-C or a closed
+# window: killing the console kills ipopt, which aborts with
+#   forrtl: error (200): program aborting due to window-CLOSE event
+# and the parent records the task as ERROR (returncode 2), not as interrupted.
+# A plain re-run will NOT pick those up — only TIMEOUT, STALLED, PARTIAL and
+# NO_OUTPUT resume automatically, because a genuine ERROR is meant to be read by
+# a human before being retried. So read one log first, confirm it says
+# window-CLOSE, then re-run with RETRY=1.
+#   tail out/_run_all/<tag>/logs/<season>_<FEEDER>_<SUB>.log
+RETRY="${RETRY:-}"
+RETRY_FLAG=""
+[ -n "$RETRY" ] && RETRY_FLAG="--retry-failed"
+
+# RESTART=1 adds --restart, which discards a queued task's partial output and
+# solves it from scratch. Needed when the kill left a TRUNCATED parquet (valid
+# PAR1 header, no footer): that file can be neither resumed nor read by
+# analyse_results, so the analysis stage dies with
+#   ArrowInvalid: Parquet magic bytes not found in footer
+# and the run ends with no metrics_by_substation.csv and no RUN_SUMMARY.md.
+# --restart only touches tasks that are actually QUEUED, so paired with RETRY=1
+# it rebuilds just the broken substations and leaves every DONE one alone.
+# Find truncated files first with tools/check_parquet_footers.py.
+RESTART="${RESTART:-}"
+RESTART_FLAG=""
+[ -n "$RESTART" ] && RESTART_FLAG="--restart"
+
+# REPLAN=1 adds --replan. Needed ONLY when a tag already holds a plan and you
+# want to widen it — e.g. pen15 was planned for lexcen alone and you now want
+# saunders and birrigai in it. Without it the bare command continues the
+# existing plan and the new feeders are never queued.
+#
+# IT IS NOT FREE. With --replan, tasks already marked DONE are no longer
+# skipped (run_all_feeders.py line ~996), so every completed substation under
+# that tag is solved again. Re-planning also rewrites each substation's .npz
+# bundle during warm-up, which can stale the checkpoints from the first pass.
+# Budget for a full re-solve of whatever that tag already finished.
+REPLAN="${REPLAN:-}"
+REPLAN_FLAG=""
+[ -n "$REPLAN" ] && REPLAN_FLAG="--replan"
+
 # The canonical max-demand summer week. Same file as the 1.0x rung.
 # Summer only: the crossover is a midday-export question and the winter week
 # has no midday export worth scaling. Running it would cost hours and answer
@@ -121,13 +162,36 @@ pass () {
   local lvl="$1" tag="$2" rc=0
   echo
   echo "=============================================================="
-  echo ">>> penetration ${lvl}x  tag=${tag}  feeders=${FEEDERS}"
+  echo ">>> penetration ${lvl}x  tag=${tag}  feeders=${FEEDERS}${RETRY:+  (retrying failed/interrupted tasks)}"
   echo ">>> started $(date '+%Y-%m-%d %H:%M:%S')"
   echo "=============================================================="
-  python scripts/run_all_feeders.py --run --feeders "$FEEDERS" \
-    $COMMON --tag "$tag" --extra="--scale-export $lvl"
+  # NO --run and NO --plan. run_all_feeders decides with
+  #     do_plan = args.plan or args.replan or (not args.run and not have_plan)
+  # so passing --run explicitly makes `not args.run` false and a FRESH tag
+  # plans nothing, queues nothing, and exits 0 in three seconds having solved
+  # nothing at all. The bare command plans when there is no plan and runs
+  # either way, which is what every other orchestrator in this repo does.
+  python scripts/run_all_feeders.py --feeders "$FEEDERS" \
+    $COMMON $RETRY_FLAG $RESTART_FLAG $REPLAN_FLAG --tag "$tag" \
+    --extra="--scale-export $lvl"
   rc=$?          # capture IMMEDIATELY — any command in between overwrites it
   echo "<<< ${tag} finished $(date '+%Y-%m-%d %H:%M:%S') with exit code $rc"
+
+  # Exit code 0 is NOT proof that anything was solved — "nothing to run" exits
+  # clean. Check for the artefacts instead.
+  local made=0
+  for d in out/*/"${tag}_summer"; do
+    [ -f "$d/RUN_SUMMARY.md" ] && made=$((made + 1))
+  done
+  if [ "$made" -eq 0 ]; then
+    echo "!!! ${tag} produced NO completed run directory. Exit code 0 here"
+    echo "!!! usually means the planner queued nothing, not that it succeeded."
+    echo "!!! Check the lines above for 'nothing to run'. If the tag already"
+    echo "!!! holds a plan for different inputs, add --replan."
+    rc=1
+  else
+    echo "    ${tag}: ${made} completed run director(y/ies)"
+  fi
   if [ "$rc" -ne 0 ]; then
     echo "!!! ${tag} FAILED. Continuing to the next level so a bad rung does"
     echo "!!! not cost you the whole night — but do not aggregate until it is"

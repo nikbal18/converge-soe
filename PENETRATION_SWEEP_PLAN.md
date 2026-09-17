@@ -366,6 +366,76 @@ OneDrive. Check steps 0.3 and 0.4, then re-run the same command to resume.
 than a slice. The sliced weekly files have a header row; `Gold_creek_summer.csv`
 does not. This sweep uses the slice, so you should not hit it here.
 
+**It finishes in three seconds saying `nothing to run — every task is DONE or
+deferred`.** The planner queued nothing. Exit code 0 does not mean it worked,
+which is why the script now counts completed run directories afterwards and
+fails loudly if there are none. Two causes:
+
+- The tag already holds a plan built from different inputs, so the bare command
+  continues that plan instead of making a new one. Add `--replan` to the
+  `run_all_feeders.py` line for that tag.
+- Someone added `--run` to the invocation. Do not. `run_all_feeders` computes
+  `do_plan = args.plan or args.replan or (not args.run and not have_plan)`, so
+  an explicit `--run` on a fresh tag suppresses planning entirely and it solves
+  nothing. The bare command is correct.
+
+**You hit Ctrl-C, or closed the window, and now a re-run skips the unfinished
+substations.** Killing the console kills ipopt, which is Fortran, so it aborts
+with `forrtl: error (200): program aborting due to window-CLOSE event` and the
+parent records the task as `ERROR` (returncode 2) rather than as interrupted.
+Only `TIMEOUT`, `STALLED`, `PARTIAL` and `NO_OUTPUT` resume automatically;
+`ERROR` and `RUNNING` are held back deliberately, because a real error should be
+read before it is retried.
+
+Check what you are dealing with first:
+
+```bash
+python - <<'PY'
+import json
+from collections import Counter
+s = json.load(open('out/_run_all/pen15/state.json'))
+print(Counter(v['status'] for v in s['tasks'].values()))
+for k, v in s['tasks'].items():
+    if v['status'] != 'DONE':
+        print(f"  {v['status']:16s} {k.split('|')[-1]}")
+PY
+```
+
+Then read one failing task's log:
+
+```bash
+tail -25 out/_run_all/pen15/logs/summer_GOLDCR_8HB_LEXCEN_S_8029_AT.log
+```
+
+If it says `window-CLOSE event`, it was the interrupt and the work is sound.
+Re-run with `RETRY=1`:
+
+```bash
+RETRY=1 LEVELS="1.5" FEEDERS="lexcen" bash run_penetration_sweep.sh 2>&1 | tee "run_pen15_retry_$(date +%F_%H%M).log"
+```
+
+Finished substations are skipped, interrupted ones resume from their last
+checkpoint. If the log says something else, read it properly before adding
+`RETRY=1`, because that flag also re-queues genuine failures and will hide them.
+
+**Then check for truncated parquet before you trust the result.** A kill can
+land mid-write and leave a file with a valid `PAR1` header and no footer. It
+cannot be resumed and it cannot be read, so the solve looks finished while the
+analysis stage dies with `ArrowInvalid: Parquet magic bytes not found in
+footer`, and you get no `metrics_by_substation.csv` and no `RUN_SUMMARY.md`:
+
+```bash
+python tools/check_parquet_footers.py out/GOLDCR_8HB_LEXCEN/pen15_summer
+```
+
+If it names any files, re-solve just those substations from scratch by adding
+`RESTART=1`. It only touches tasks that are actually queued, so completed
+substations are untouched:
+
+```bash
+RETRY=1 RESTART=1 LEVELS="1.5" FEEDERS="lexcen" bash run_penetration_sweep.sh 2>&1 | tee "run_pen15_restart_$(date +%F_%H%M).log"
+```
+
 **Disk fills up.** Each rung writes per-timestep parquet for every
 substation-scenario. Check before you start:
 

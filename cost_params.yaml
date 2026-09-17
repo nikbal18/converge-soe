@@ -8,21 +8,56 @@
 # updated annually against a 10-year trailing average. State which year you use.
 wacc_nominal_vanilla: 0.0585
 
-# ---------------------------------------------------------------- PLACEHOLDER
-# NOT SOURCED. The AER repex model does not publish a standard asset life for
-# distribution transformers - it calibrates average replacement age per
-# distributor from observed practice. Replace from Evoenergy Appendix 1.9
-# (CutlerMerz repex results) or the Evoenergy RIN age profile.
-# Note there are two different lives: the REGULATORY depreciation life (drives
-# the RAB, used in the tariff step) and the PHYSICAL replacement age (what this
-# annuity needs). This parameter is the physical one.
+# ---------------------------------------------------------------- SOURCED
+# REGULATORY depreciation life. AER Final decision, Evoenergy distribution
+# determination 2024-29, Depreciation module - Distribution (April 2024),
+# sheet 'RAB input' row 189: asset class "Distribution Substations",
+# RAB standard life 40 years (same in the 2014-19 and 2019-24 columns).
+# Remaining life as at 2018-19 was 35.19 years. Sheet 'TAB input' row 182 gives
+# the same 40 years for the tax standard life, remaining 35.51.
+# This drives the RAB and the tariff step. It is NOT a prediction of when a
+# transformer physically fails.
+regulatory_asset_life_years: 40
+
+# ---------------------------------------------------------------- ASSUMED
+# PHYSICAL replacement age - what the annuity in this model actually needs.
+# Deliberately NOT the 40 above. Evidence that transformers outlive the
+# regulatory life:
+#   - Powercor/CitiPower asset class overview (PAL BUS 4.06, Jan 2025):
+#     "expected service life ... typically around 55 years", and a forecast
+#     replacement rate of ~1%/yr, which they note implies an average life of
+#     105 years before replacement.
+#   - Ergon Energy (Jan 2024): ~7,000 of 105,500 distribution transformers are
+#     already over 50 years old.
+# 50 sits between the regulatory 40 and Powercor's 55. Swept below.
 standard_asset_life_years: 50
 
-# ---------------------------------------------------------------- ESTIMATE
-# THE ONE NUMBER TO CHANGE. Installed replacement cost of one distribution
-# transformer, AUD. Working estimate, not sourced. When set, the per-kVA table
-# below is ignored entirely.
-unit_replacement_cost_flat_aud: 100000
+# ---------------------------------------------------------------- INTERNAL
+# INSTALLED replacement cost of one distribution transformer, AUD.
+# 400,000 from Evoenergy internal sources (Nikki, 2026-09-17).
+#
+# DECISION, and it is the right one: this is the DNSP's AVOIDED EXPENDITURE,
+# not the equipment price. When ageing brings a replacement forward, what the
+# network actually spends is the whole project - transformer, civils,
+# switchgear, cabling, outage management, traffic control, design, project
+# management and corporate overhead. Public equipment-only figures
+# (Ergon $13,200-$47,200; Powercor ~$19,500 per kiosk) are the wrong basis for
+# an avoided-cost question and are retained below only as a sanity floor.
+# This also lines up with the regulatory treatment: the AER asset class that
+# carries these assets is "Distribution Substations", which bundles the whole
+# substation, not a transformer unit rate.
+#
+# THE ONE QUESTION THAT DECIDES WHETHER 400k IS RIGHT (answerable from Network
+# Planning, and it should be stated in the methodology either way):
+#   When a distribution transformer reaches end of life, does Evoenergy run a
+#   full substation replacement project, or swap the transformer into the
+#   existing kiosk, civils and switchgear?
+# If it is a full project, 400k is the avoided cost and the model is correct.
+# If it is a transformer swap, 400k attributes civils and switchgear - assets
+# with 60-year lives that do not age thermally - to insulation ageing, and the
+# network-side result is overstated by whatever that share is.
+# This parameter scales the entire network-side result linearly.
+unit_replacement_cost_flat_aud: 400000
 
 # Optional per-kVA bands, used ONLY if the flat cost above is null.
 unit_replacement_cost_aud:
@@ -47,6 +82,29 @@ unit_replacement_cost_aud:
 # asset life at all, so it is swept below.
 normal_insulation_life_hours: 180000.0
 
+# ---------------------------------------------------------------- SOURCED
+# Share of an avoided capital expenditure the NETWORK actually keeps.
+#
+# Under the building-block framework a deferred replacement is not a DNSP
+# profit: capex enters the RAB, the DNSP earns the WACC on the RAB either way,
+# and a smaller RAB means a smaller revenue requirement and lower network
+# tariffs. Section 3 of the draft already says this. So "what does the DNSP
+# save" and "what do consumers save" are different numbers, and the split is
+# set by the Capital Expenditure Sharing Scheme.
+#
+# AER Capital expenditure incentive guideline, April 2023, s2.3.2:
+#   "A sharing factor of 30 per cent allocates 30 per cent of any efficiency
+#   gain or loss to the NSP" - so the DNSP retains 30% of an underspend up to
+#   and including 10% of the approved forecast allowance, and 20% on any
+#   amount beyond that. The consumer share flows through the RAB roll-forward
+#   at the END of the regulatory control period, not annually.
+#
+# Use this to report BOTH stakeholder rows from one avoided-cost figure:
+#   DNSP retained benefit  = avoided capex x cess_retention_share
+#   consumer benefit       = avoided capex x (1 - cess_retention_share)
+# That is exactly the split section 9.3 argues for.
+cess_retention_share: 0.30
+
 # How the DNSP's ageing cost is valued. Two valuations of the SAME wear -
 # report one as headline, the other as a bound, never add them.
 #   depletion - life consumed x (unit cost / normal insulation life). Always
@@ -64,11 +122,63 @@ end_of_life_percent_lol: 100.0
 starting_loss_of_life_percent: 0.0
 
 # Value of the energy the DTR passes that a nameplate-limited DOE would not.
-# The same price the DOE runs assumed. An assumption, not a result.
-energy_value_per_kwh: 0.10
+#
+# SOURCED: NSW averaged $114/MWh across FY2023-24 - the year both simulation
+# windows sit in - per AER State of the energy market 2024, Ch.2 Fig 2.4 p.19.
+# So 0.114 $/kWh is the defensible flat annual price.
+#
+# THE LEVEL IS RIGHT AND THE SHAPE IS WRONG. Recovered export is MIDDAY PV
+# export, and midday is when NSW prices are lowest and increasingly negative:
+# negative price intervals in NSW rose 61% in 2023-24 (same report, Fig 2.6
+# p.22). A flat annual price therefore OVERSTATES the wholesale value of this
+# particular energy. Compute a second figure time-weighted over the actual
+# simulated intervals (AEMO publishes 30-minute NSW1 prices; the runs are
+# already 30-minute) and report both. That is a result, not a caveat.
+energy_value_per_kwh: 0.114
+
+# ---------------------------------------------------------------- ASSUMED
+# What recovered export is worth to the CUSTOMER, as distinct from the market.
+# There is NO regulated ACT feed-in tariff: the ACT Government states the rates
+# are voluntary and unregulated. Retailer offers spanned roughly 5 to 24.6
+# c/kWh in Sept 2026, with the top of that range on conditional or
+# volume-capped offers rather than a standard rate. 0.08 is a mid-range
+# standard offer. Sweep it rather than defending one number.
+# Limitations note: the legacy ACT Premium Feed-in Tariff closed to new
+# entrants on 13 July 2011 and pays for 20 years, so ~9,895 generators
+# (34.8 MW) were still on it in 2024-25 and those terms are now expiring.
+feed_in_tariff_per_kwh: 0.08
+
+# ---------------------------------------------------------------- ASSUMED
+# Grid emissions intensity, t CO2-e/MWh. NGA Factors 2025 scope 2 for NSW and
+# the ACT (they share one factor) is 0.64 kg CO2-e/kWh = 0.64 t/MWh.
+# CONFIRM FROM THE PRIMARY PDF - dcceew.gov.au blocks automated fetching, so
+# this came from a secondary compilation. Get the scope 3 factor there too.
+#
+# TWO CAVEATS THAT MUST BE STATED:
+#  1. This is an AVERAGE factor. No Australian MARGINAL emissions factor is
+#     published - not by NGA, and the NSW reporting guidelines use average,
+#     location-based factors and do not discuss the marginal case. Either use
+#     this and say it is an average, or assume a marginal generator and defend
+#     it. Do not call an average factor marginal.
+#  2. The ACT procures 100% renewable electricity through its reverse
+#     auctions, so attributing avoided emissions to additional ACT rooftop
+#     export is contestable. Take a position in one sentence.
+grid_emissions_intensity_t_per_mwh: 0.64
+
+# ---------------------------------------------------------------- SOURCED
+# Carbon value, AUD per t CO2-e. ACCU generic spot $36.28 and Safeguard
+# Mechanism Credit spot $36.40, both at 31 March 2026, per the Clean Energy
+# Regulator Quarterly Carbon Market Report. Confirm at the CER directly.
+# NOTE this is a COMPLIANCE market price, not a social cost of carbon. Section
+# 2.4 of the draft is titled "Society" - if that section is pricing social
+# damage, the ACCU price is the wrong instrument and a published social cost of
+# carbon is the right one. Decide which question section 7 is answering.
+carbon_value_aud_per_t: 36.28
 
 sensitivity:
   starting_lol_percent: [0.0, 30.0, 60.0]
   wacc_absolute_delta: [-0.01, 0.0, 0.01]
-  unit_cost_multiplier: [0.5, 1.0, 2.0]
+  # Widened downward: at a 400k central value, the entire PUBLIC comparator
+  # range ($13k-$47k) sits below a 0.5x multiplier. 0.05 reaches $20k.
+  unit_cost_multiplier: [0.05, 0.25, 0.5, 1.0, 2.0]
   normal_insulation_life_hours: [65000.0, 135000.0, 180000.0]

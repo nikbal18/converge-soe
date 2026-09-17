@@ -67,13 +67,68 @@ PARAM_SETS = {
                       R=5.0, n=0.8, m=0.8, I_rated=1.0, theta_HS_max=120.0, dt=30.0),
 }
 
-# Hot-spot exposure tiers for the two-regime treatment of BAU. CONFIRM these
-# against AS/NZS 60076.7 before they go in the thesis - they are a placeholder
-# ladder, not quoted from the standard.
+# Hot-spot exposure tiers. SOURCED: AS/NZS 60076.7:2013 Table 4 (p.18),
+# "Current and temperature limits applicable to loading beyond nameplate
+# rating", DISTRIBUTION TRANSFORMERS column. Verified against the standard.
+#
+#   Normal cyclic loading        1,5 pu   winding hot-spot 120 C   top-oil 105 C
+#   Long-time emergency loading  1,8 pu   winding hot-spot 140 C   top-oil 115 C
+#   Short-time emergency loading 2,0 pu   winding hot-spot SEE 7.2.1
+#
+# READ THE ROW LABELS CAREFULLY. The 120 and 140 figures are for "Winding
+# hot-spot temperature AND metallic parts in contact with cellulosic insulation
+# material". Table 4 also carries an "Other metallic hot-spot temperature (in
+# contact with oil, aramid paper, glass fibre materials)" row at 140/160 - that
+# is a DIFFERENT quantity and not what this model computes. This model computes
+# winding hot-spot, so only 120 and 140 are limits that apply to it.
+#
+# 160 C IS NOT A DISTRIBUTION TRANSFORMER LIMIT. Table 4 gives 160 C only for
+# MEDIUM and LARGE POWER transformers under short-time emergency loading; the
+# distribution column says "See 7.2.1" instead. It is retained in the tier list
+# purely as a diagnostic band, because BAU peaks at 206.5 C and one number above
+# the ceiling is not enough resolution. Do not present it as a standard limit.
+#
+# Also note the NOTE under Table 4: the current and temperature limits "are not
+# intended to be valid simultaneously" - either may be tightened to satisfy the
+# other. Relevant to how the DTR constraint is framed, since K2_max caps current
+# while theta_HS_max caps temperature.
 DEFAULT_TIERS = (120.0, 140.0, 160.0)
+STANDARD_TIERS = (120.0, 140.0)   # the two that AS/NZS 60076.7 actually sets
 
-# Above this the Arrhenius ageing relation is not credible; ageing accumulated
-# above it is reported separately rather than silently summed.
+# Ageing above this is reported as exposure rather than priced as wear.
+#
+# SOURCED, and the standard states the mechanism directly. AS/NZS 60076.7:2013
+# clause 7.2.1, "Specific limitations for distribution transformers":
+#
+#   "No limit is set for the top-oil and hot-spot temperature under short-time
+#    emergency loading for distribution transformers because it is usually
+#    impracticable to control the duration of emergency loading in this case.
+#    It should be noted that when the hot-spot temperature exceeds 140 C, gas
+#    bubbles may develop which could jeopardize the dielectric strength of the
+#    transformer (see 5.3)."
+#
+# So above 140 C the failure mode the standard itself identifies is DIELECTRIC -
+# bubble formation collapsing the oil's dielectric strength - not gradual
+# thermal ageing of the paper. Summing Arrhenius hours through that region
+# prices the wrong mechanism. Hours above are reported unpriced, which makes the
+# priced saving conservative: the avoided failure risk is strictly additional.
+#
+# This supersedes two weaker arguments that were considered and dropped:
+#  - "the Arrhenius relation is not credible above 140 C". The 80-140 C range is
+#    the span of the IEC relative ageing rate table for NON-thermally-upgraded
+#    paper referenced to 98 C. This model uses the IEEE C57.91 relation
+#    (theta_ref 110 C, B = 15,000 K, normal life 180,000 h), so that range is
+#    the bound on a different curve.
+#  - "140 C is the top of the permitted loading envelope". True for long-time
+#    emergency, but 7.2.1 sets no hot-spot limit at all for distribution
+#    transformers under short-time emergency, so the envelope argument alone
+#    does not close it. The gas-bubbling clause does.
+#
+# METHODOLOGY NOTE: this project uses the IEC/AS-NZS 60076.7 THERMAL model
+# (top-oil and hot-spot equations and exponents) with the IEEE C57.91 AGEING
+# relation. Common, defensible, and the same combination Evoenergy's own fleet
+# study uses - but state it rather than blurring the two, since the midterm
+# marker flagged notation drift across variants of the standard's name.
 DEFAULT_CEILING = 140.0
 
 SCENARIOS = ("bau", "doe_static", "doe_dtr")
